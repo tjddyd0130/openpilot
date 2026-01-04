@@ -140,6 +140,7 @@ class Amplifier:
     return self.set_configs([self._get_shutdown_config(amp_disabled), ])
 
   def initialize_configuration(self, model: str) -> bool:
+    return True
     cfgs = [
       self._get_shutdown_config(True),
       *BASE_CONFIG,
