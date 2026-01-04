@@ -103,6 +103,13 @@ InfiniteCableTogglesPanel::InfiniteCableTogglesPanel(SettingsWindow *parent) : L
       "../assets/icons/eye_closed.png",
       false,
     },
+	  {
+      "DisableDM",
+      tr("Disable Driver Monitoring"),
+      tr("완전히 운전자 모니터링을 비활성화합니다. 사용 시 주의가 필요합니다."),
+      "../assets/icons/monitoring.png", // 아이콘 경로는 기존 파일 참고
+      false,
+    },
   };
 
   for (auto &[param, title, desc, icon, needs_restart] : toggle_defs) {
