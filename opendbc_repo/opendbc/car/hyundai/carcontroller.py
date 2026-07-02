@@ -262,6 +262,14 @@ class CarController(CarControllerBase):
     self.angle_limit_counter, apply_steer_req = common_fault_avoidance(abs(CS.out.steeringAngleDeg) >= MAX_ANGLE, CC.latActive,
                                                                        self.angle_limit_counter, self.max_angle_frames,
                                                                        MAX_ANGLE_CONSECUTIVE_FRAMES)
+    if self.car_fingerprint == CAR.KIA_EV_SK3:
+      # The generic >85deg guard cuts the request 2 frames (with ToiFlt=1) about once per
+      # second while the angle stays large. This MDPS is request-bit sensitive: each cut
+      # drops the whole overlay, causing latch/drop cycling through every turn — while the
+      # >90deg EPS fault the guard prevents has never been observed on this car (overlay
+      # held at 89deg under high torque). Keep the request steady; revert if
+      # steerFaultTemporary starts appearing at deep angles.
+      apply_steer_req = CC.latActive
 
     #apply_angle = apply_std_steer_angle_limits(actuators.steeringAngleDeg, self.apply_angle_last, CS.out.vEgoRaw,
     #                                           CS.out.steeringAngleDeg, CC.latActive, self.params.ANGLE_LIMITS)
