@@ -11,7 +11,13 @@
 #
 # 사용:
 #   ./wayon_cloud_setup.sh --dir <Wayon>/cloudflare/wayon-cloud
-#   ./wayon_cloud_setup.sh --dir ... --no-tunnel   # 라이브뷰·원격SSH 포기, 설정이 훨씬 단순
+#   ./wayon_cloud_setup.sh --dir ... --no-tunnel            # 라이브뷰·원격SSH 포기, 가장 단순
+#   ./wayon_cloud_setup.sh --dir ... --tunnel-id <UUID>     # 대시보드에서 만든 터널 사용
+#
+# 도메인이 없다면 --tunnel-id 를 써라.
+# 'cloudflared tunnel login' 은 Cloudflare 에 등록된 도메인(zone)이 하나는 있어야
+# 완료된다. 도메인이 없으면 Zero Trust 대시보드에서 터널을 만들고(도메인 불필요),
+# 터널 ID 와 토큰을 받아 --tunnel-id 로 넘기면 나머지는 그대로 자동화된다.
 #
 # --no-tunnel 을 쓰면 [[vpc_networks]] 가 빠져서 문서가 경고한 배포 실패(code 10196)를
 # 아예 만나지 않는다. 배터리·주차위치·주행기록·스냅샷은 그대로 동작하고
@@ -28,6 +34,7 @@ tunnel_name="wayon-comma"
 db_name="wayon_cloud"
 kv_binding="WAYON_SNAPSHOTS"
 use_tunnel=1
+tunnel_id_arg=""
 secrets_out="wayon-secrets.txt"
 
 step_no=0
@@ -48,6 +55,7 @@ while [ $# -gt 0 ]; do
     --dir)         worker_dir="${2:-}"; shift 2 ;;
     --name)        worker_name="${2:-}"; shift 2 ;;
     --tunnel-name) tunnel_name="${2:-}"; shift 2 ;;
+    --tunnel-id)   tunnel_id_arg="${2:-}"; shift 2 ;;
     --no-tunnel)   use_tunnel=0; shift ;;
     -h|--help)     usage ;;
     *) die "알 수 없는 인자: $1  (--help 참고)" ;;
@@ -81,8 +89,15 @@ if ! npx --yes wrangler whoami >/dev/null 2>&1; then
 fi
 ok "wrangler 로그인 확인"
 
-if [ "$use_tunnel" -eq 1 ]; then
-  command -v cloudflared >/dev/null || die "cloudflared 가 없다. 설치하거나 --no-tunnel 로 실행하라"
+if [ "$use_tunnel" -eq 1 ] && [ -z "$tunnel_id_arg" ]; then
+  # cloudflared CLI 로 터널을 만들려면 'cloudflared tunnel login' 이 필요하고,
+  # 그 로그인은 Cloudflare 에 등록된 도메인(zone)이 하나는 있어야 완료된다.
+  # 도메인이 없으면 대시보드에서 터널을 만든 뒤 --tunnel-id 로 넘겨라.
+  command -v cloudflared >/dev/null || die "cloudflared 가 없다.
+     다음 중 하나를 선택하라:
+       - cloudflared 설치 후 'cloudflared tunnel login' (Cloudflare 에 도메인이 있어야 한다)
+       - 대시보드에서 터널을 만들고  --tunnel-id <UUID> 로 실행
+       - --no-tunnel 로 실행 (라이브뷰·원격SSH 포기)"
   ok "cloudflared 있음"
 fi
 
@@ -103,7 +118,22 @@ ask_value() {  # ask_value <설명> -> stdout
 # ------------------------------------------------------------- 1. 터널
 tunnel_id=""
 tunnel_token=""
-if [ "$use_tunnel" -eq 1 ]; then
+if [ "$use_tunnel" -eq 1 ] && [ -n "$tunnel_id_arg" ]; then
+  # 대시보드에서 만든 터널을 쓰는 경로. 도메인이 없어도 된다.
+  step "Cloudflare 터널 (대시보드에서 만든 것 사용)"
+  tunnel_id="$tunnel_id_arg"
+  ok "터널 ID: $tunnel_id"
+  tunnel_token="${WAYON_TUNNEL_TOKEN:-}"
+  if [ -z "$tunnel_token" ]; then
+    printf '  터널 토큰(eyJhIjoi... )을 붙여넣어라 (화면에 표시되지 않음): ' >&2
+    read -r -s tunnel_token
+    printf '\n' >&2
+  fi
+  [ -n "$tunnel_token" ] && ok "터널 토큰 확보" || warn "터널 토큰 없음. 기기 설정 때 직접 넣어야 한다"
+  warn "대시보드의 터널 상세 > Private Network 에 172.31.255.254/32 가 등록돼 있어야 한다."
+  warn "빠지면 대시보드·주행기록은 되는데 360 라이브뷰만 실패한다."
+
+elif [ "$use_tunnel" -eq 1 ]; then
   step "Cloudflare 터널 준비 ($tunnel_name)"
 
   if cloudflared tunnel info "$tunnel_name" >/dev/null 2>&1; then
