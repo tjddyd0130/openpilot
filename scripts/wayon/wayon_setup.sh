@@ -81,26 +81,46 @@ run_check() {
     bad "config.json 없음 -> wayon 프로세스가 기동하지 않는다"
   fi
 
+  # 터널을 아예 설치하지 않았으면(--no-tunnel 구성) 관련 항목을 실패로 표시하지 않는다.
+  local tunnel_installed=0
+  if [ -x "$CLOUDFLARED_BIN" ] || [ -r "$TUNNEL_TOKEN_PATH" ] || [ -x "$SUPERVISOR_PATH" ]; then
+    tunnel_installed=1
+  fi
+
   info ""
   info "프로세스"
   local found=0
-  for p in wayon_vehicle_telemetry wayon_live_stream wayon_remote cloudflared; do
+  for p in wayon_vehicle_telemetry wayon_live_stream wayon_remote; do
     if pgrep -f "$p" >/dev/null 2>&1; then ok "$p 실행 중"; found=$((found+1))
     else bad "$p 미실행"; fi
   done
+  if [ "$tunnel_installed" -eq 1 ]; then
+    pgrep -f cloudflared >/dev/null 2>&1 && ok "cloudflared 실행 중" \
+      || bad "cloudflared 미실행 (주행 중이면 정상 - supervisor 가 오프로드에서만 올린다)"
+  fi
   [ "$found" -eq 0 ] && info "  (config.json 작성 후 재부팅 또는 sudo systemctl restart comma 필요)"
 
   info ""
-  info "터널"
-  [ -x "$CLOUDFLARED_BIN" ] && ok "cloudflared 설치됨" || bad "cloudflared 없음 (라이브뷰·원격SSH 불가)"
-  [ -r "$TUNNEL_TOKEN_PATH" ] && ok "터널 토큰 있음" || bad "터널 토큰 없음"
-  [ -x "$SUPERVISOR_PATH" ] && ok "supervisor 설치됨" || bad "supervisor 없음"
+  if [ "$tunnel_installed" -eq 0 ]; then
+    info "터널: 미설치"
+    info "  --no-tunnel 로 설정했다면 정상이다. 배터리·주차위치·주행기록·스냅샷은 동작하고"
+    info "  360 라이브뷰와 원격 SSH 만 사용할 수 없다."
+    info "  나중에 붙이려면 PC 에서 --no-tunnel 없이 wayon_cloud_setup.sh 를 다시 돌린 뒤"
+    info "  이 스크립트를 --tunnel 로 실행하면 된다."
+  else
+    info "터널"
+    [ -x "$CLOUDFLARED_BIN" ] && ok "cloudflared 설치됨" || bad "cloudflared 없음"
+    [ -r "$TUNNEL_TOKEN_PATH" ] && ok "터널 토큰 있음" || bad "터널 토큰 없음"
+    [ -x "$SUPERVISOR_PATH" ] && ok "supervisor 설치됨" || bad "supervisor 없음"
+  fi
 
   if [ -n "$cfg_endpoint" ]; then
     info ""
     info "클라우드 응답 (조회 토큰이 없으므로 unauthorized 가 정상)"
+    # curl 은 실패해도 %{http_code} 로 000 을 출력하므로 폴백에서 값을 덧붙이면 안 된다.
     local code
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$cfg_endpoint/api/json" || echo "000")"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 8 "$cfg_endpoint/api/json" || true)"
+    [ -n "$code" ] || code="000"
     case "$code" in
       000) bad "연결 실패 - 주소 또는 네트워크 확인" ;;
       401|403) ok "서버 살아있음 (HTTP $code)" ;;
