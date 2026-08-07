@@ -1,36 +1,47 @@
-import { getDriveVisionHudRenderer } from "./hud_renderer.js";
-
 const contentInstances = new WeakMap();
 
-// Vision-owned lifecycle for the green driving HUD. Other modules feed state
-// through this API instead of controlling #driveHudCard directly.
+// Vision-owned lifecycle for the driving HUD. Other modules feed state through
+// this API instead of controlling the overlay directly. Rendering belongs to the
+// Carrot HUD overlay (hud/); this module only owns activation, suppression, and
+// payload replay.
 export function createDriveVisionHudContent(options = {}) {
   const target = options.target || globalThis;
   const documentRoot = options.document || target.document;
   const root = options.root || documentRoot?.getElementById?.("driveHudCard");
   const workspace = options.workspace || documentRoot?.getElementById?.("carrotDriveWorkspace");
   const stage = options.stage || documentRoot?.getElementById?.("carrotStage");
-  const renderer = options.renderer || getDriveVisionHudRenderer(target);
-  if (!root || !workspace || !renderer?.init || !renderer?.update) return null;
+  if (!root || !workspace) return null;
 
   const suppressions = new Set();
   let mounted = false;
   let active = false;
-  let initialized = false;
   let destroyed = false;
   let lastPayload = null;
 
-  function viewportOrientation() {
+  function presentationOverlay() {
+    return target.CarrotHudOverlay || null;
+  }
+
+  function viewportSize() {
     const viewport = target.visualViewport;
-    const width = Number(viewport?.width || documentRoot.documentElement.clientWidth || target.innerWidth || 0);
-    const height = Number(viewport?.height || documentRoot.documentElement.clientHeight || target.innerHeight || 0);
+    return {
+      width: Number(viewport?.width || documentRoot.documentElement.clientWidth || target.innerWidth || 0),
+      height: Number(viewport?.height || documentRoot.documentElement.clientHeight || target.innerHeight || 0),
+    };
+  }
+
+  function viewportOrientation() {
+    const { width, height } = viewportSize();
     return height >= width ? "vertical" : "horizontal";
   }
 
-  function ensureInitialized() {
-    if (initialized || destroyed) return false;
-    renderer.init();
-    initialized = true;
+  function syncPresentation() {
+    const overlay = presentationOverlay();
+    if (!overlay) return false;
+    for (const reason of suppressions) overlay.setSuppressed?.(reason, true);
+    if (active && !destroyed) overlay.activate?.();
+    else overlay.deactivate?.();
+    if (lastPayload) overlay.update?.(lastPayload);
     return true;
   }
 
@@ -62,16 +73,17 @@ export function createDriveVisionHudContent(options = {}) {
     const changed = !active;
     mounted = true;
     active = true;
-    ensureInitialized();
-    if (lastPayload) renderer.update(lastPayload);
+    const overlay = presentationOverlay();
+    syncPresentation();
     syncVisibility();
-    renderer.relayout?.();
+    overlay?.relayout?.(viewportSize());
     return changed;
   }
 
   function deactivate() {
     const changed = active;
     active = false;
+    presentationOverlay()?.deactivate?.();
     syncVisibility();
     return changed;
   }
@@ -79,15 +91,16 @@ export function createDriveVisionHudContent(options = {}) {
   function resize() {
     if (destroyed || !active) return false;
     syncVisibility();
-    renderer.relayout?.();
+    presentationOverlay()?.relayout?.(viewportSize());
     return true;
   }
 
   function update(payload) {
     if (!payload || destroyed) return false;
+    // Held even while the overlay is missing: syncPresentation replays the last
+    // payload as soon as the overlay installs.
     lastPayload = payload;
-    ensureInitialized();
-    renderer.update(payload);
+    presentationOverlay()?.update?.(payload);
     syncVisibility();
     return true;
   }
@@ -103,26 +116,27 @@ export function createDriveVisionHudContent(options = {}) {
     const key = String(reason || "external");
     if (value) suppressions.add(key);
     else suppressions.delete(key);
+    presentationOverlay()?.setSuppressed?.(key, Boolean(value));
     if (key === "replay-insights") root.classList.toggle("is-replay-suppressed", Boolean(value));
     return syncVisibility();
   }
 
   function renderText() {
     if (destroyed) return false;
-    ensureInitialized();
-    renderer.renderText?.();
+    if (lastPayload) presentationOverlay()?.update?.(lastPayload);
     return true;
   }
 
   function status() {
+    const presentation = presentationOverlay()?.status?.() || null;
     return Object.freeze({
       mounted,
       active,
-      initialized,
       destroyed,
       orientation: viewportOrientation(),
       visible: !root.hidden && !root.classList.contains("is-vision-hud-suppressed"),
       suppressions: Object.freeze(Array.from(suppressions)),
+      presentation,
     });
   }
 
@@ -133,6 +147,7 @@ export function createDriveVisionHudContent(options = {}) {
     destroyed = true;
     lastPayload = null;
     suppressions.clear();
+    presentationOverlay()?.destroy?.();
     root.classList.remove("is-replay-suppressed", "driveHudCard--loading");
     syncVisibility();
     return true;
@@ -161,6 +176,7 @@ export function createDriveVisionHudContent(options = {}) {
     setLoading,
     setSuppressed,
     renderText,
+    syncPresentation,
     status,
     destroy,
   });

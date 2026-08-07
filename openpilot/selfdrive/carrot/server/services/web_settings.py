@@ -9,12 +9,24 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from openpilot.selfdrive.carrot.web_upload import DEFAULT_WEB_UPLOAD_URL, normalize_base_url
 
 from ..config import CARROT_WEB_SETTINGS_PATH, WEB_DIR
+from .web_capabilities import is_known_web_capability
 
 
 WEB_PRIMARY_PAGES = {"last", "carrot", "setting", "tools", "logs", "terminal"}
 WEB_LANGUAGES = {"", "en", "ko", "zh"}
 WEB_REPLAY_INSIGHTS_TABS = {"events", "graphs", "sensors", "advanced"}
 WEB_DRIVE_LAYOUT_MODES = {"split", "area_1", "area_2"}
+
+# Existing settings files created before the drive-layout keys were persisted
+# should retain the former split layout. Fresh installs use WEB_SETTINGS_SPEC.
+LEGACY_DRIVE_LAYOUT_DEFAULTS = {
+  "carrot_navi_horizontal_mode": "split",
+  "carrot_navi_horizontal_area_1": "vision",
+  "carrot_navi_horizontal_area_2": "navigation",
+  "carrot_navi_vertical_mode": "split",
+  "carrot_navi_vertical_area_1": "vision",
+  "carrot_navi_vertical_area_2": "navigation",
+}
 
 DRIVE_CONTENT_CATALOG_PATH = os.path.join(
   WEB_DIR,
@@ -354,7 +366,7 @@ class _Field:
   """One web setting. Type/default and ordinary validation live here. Drive
   content choices and pair normalization are derived from the source catalog."""
 
-  __slots__ = ("key", "type", "default", "choices", "normalize")
+  __slots__ = ("key", "type", "default", "choices", "normalize", "requires_capability")
 
   def __init__(
     self,
@@ -363,12 +375,16 @@ class _Field:
     default: Any,
     choices: Optional[set] = None,
     normalize: Optional[Callable[[Any], Any]] = None,
+    requires_capability: Optional[str] = None,
   ) -> None:
+    if requires_capability is not None and not is_known_web_capability(requires_capability):
+      raise ValueError(f"unknown web capability for {key}: {requires_capability}")
     self.key = key
     self.type = type
     self.default = default
     self.choices = choices
     self.normalize = normalize
+    self.requires_capability = requires_capability
 
   def coerce(self, value: Any) -> Any:
     if self.type == "bool":
@@ -388,17 +404,21 @@ WEB_SETTINGS_SPEC: List[_Field] = [
   _Field("start_page", "enum", "last", choices=WEB_PRIMARY_PAGES),
   _Field("mini_hud_enabled", "bool", False),
   _Field("web_language", "str", "", normalize=_normalize_language),
+  _Field("web_lab_enabled", "bool", False),
   _Field("vision_fullscreen_default", "bool", False),
+  _Field("carrot_navi_fullscreen_on_tap", "bool", False),
+  _Field("vision_ar_enabled", "bool", False, requires_capability="web_lab"),
+  _Field("vision_ar_debug", "bool", False, requires_capability="web_lab"),
   _Field("vision_display_mode", "enum", "normal", choices={"fit", "normal", "crop"}),
   _Field("replay_hud_visible", "bool", False),
   _Field("replay_insights_tab", "enum", "events", choices=WEB_REPLAY_INSIGHTS_TABS),
-  _Field("carrot_navi_horizontal_mode", "enum", "split", choices=WEB_DRIVE_LAYOUT_MODES),
-  _Field("carrot_navi_horizontal_area_1", "enum", "vision"),
-  _Field("carrot_navi_horizontal_area_2", "enum", "navigation"),
+  _Field("carrot_navi_horizontal_mode", "enum", "area_1", choices=WEB_DRIVE_LAYOUT_MODES),
+  _Field("carrot_navi_horizontal_area_1", "enum", "navigation"),
+  _Field("carrot_navi_horizontal_area_2", "enum", "vision"),
   _Field("carrot_navi_split_ratio", "str", "0.70", normalize=_normalize_carrot_navi_split_ratio),
-  _Field("carrot_navi_vertical_mode", "enum", "split", choices=WEB_DRIVE_LAYOUT_MODES),
-  _Field("carrot_navi_vertical_area_1", "enum", "vision"),
-  _Field("carrot_navi_vertical_area_2", "enum", "navigation"),
+  _Field("carrot_navi_vertical_mode", "enum", "area_1", choices=WEB_DRIVE_LAYOUT_MODES),
+  _Field("carrot_navi_vertical_area_1", "enum", "navigation"),
+  _Field("carrot_navi_vertical_area_2", "enum", "vision"),
   _Field("carrot_navi_vertical_split_ratio", "str", "0.50", normalize=_normalize_carrot_navi_vertical_split_ratio),
   _Field("kmap_enabled", "bool", False),
   _Field("kmap_url", "str", "https://jominki354.github.io/kmap/", normalize=_normalize_kmap_url),
@@ -455,6 +475,8 @@ def web_settings_client_spec() -> List[Dict[str, Any]]:
   catalog_choices = [descriptor["id"] for descriptor in load_drive_content_catalog()["contents"]]
   for field in WEB_SETTINGS_SPEC:
     entry: Dict[str, Any] = {"key": field.key, "type": field.type, "default": field.default}
+    if field.requires_capability:
+      entry["requiresCapability"] = field.requires_capability
     if field.key in _DRIVE_LAYOUT_CONTENT_KEYS:
       entry["choices"] = list(catalog_choices)
     elif field.type == "enum" and field.choices:
@@ -463,13 +485,25 @@ def web_settings_client_spec() -> List[Dict[str, Any]]:
   return spec
 
 
+def web_setting_defaults_for_capability(capability_id: str) -> Dict[str, Any]:
+  return {
+    field.key: copy.deepcopy(field.default)
+    for field in WEB_SETTINGS_SPEC
+    if field.requires_capability == capability_id
+  }
+
+
 def read_web_settings() -> Dict[str, Any]:
   try:
     with open(CARROT_WEB_SETTINGS_PATH, "r", encoding="utf-8") as f:
       raw = json.load(f)
   except Exception:
     return dict(DEFAULT_WEB_SETTINGS)
-  return sanitize_web_settings(raw if isinstance(raw, dict) else {})
+  if not isinstance(raw, dict):
+    return dict(DEFAULT_WEB_SETTINGS)
+  for key, value in LEGACY_DRIVE_LAYOUT_DEFAULTS.items():
+    raw.setdefault(key, value)
+  return sanitize_web_settings(raw)
 
 
 def write_web_settings(settings: Dict[str, Any]) -> Dict[str, Any]:

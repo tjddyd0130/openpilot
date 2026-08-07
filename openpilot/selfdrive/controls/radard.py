@@ -3,7 +3,6 @@ import math
 import numpy as np
 from collections import deque
 from typing import Any
-import heapq
 import copy
 
 import capnp
@@ -12,7 +11,6 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.params import Params
 from openpilot.common.realtime import DT_MDL, Priority, config_realtime_process
 from openpilot.common.swaglog import cloudlog
-from openpilot.common.simple_kalman import KF1D
 from openpilot.selfdrive.controls.lib.drive_helpers import is_volkswagen_meb
 from openpilot.selfdrive.controls.lib.cutin_helpers import (
   associate_cutin_tracks,
@@ -1530,11 +1528,6 @@ class RadarD:
 
 # fuses camera and radar data for best lead detection
 def main() -> None:
-  if Params().get_int("RadarLeadModelMode") == 1:
-    from openpilot.selfdrive.carrot.radard_model import main as model_main
-    model_main()
-    return
-
   config_realtime_process(5, Priority.CTRL_LOW)
 
   # wait for stats about the car to come in from controls

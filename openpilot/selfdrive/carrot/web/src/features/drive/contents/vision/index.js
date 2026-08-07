@@ -1,9 +1,9 @@
 "use strict";
 
-import { installDriveVisionHudRendererFacade } from "./hud_renderer.js";
 import { installDriveVisionHudContentFacade } from "./hud_content.js";
 import { installDriveVisionReplayRenderBridgeFacade } from "./replay_render_bridge.js";
 import { installDriveVisionReplayRenderControllerFacade } from "./replay_render_controller.js";
+import { installDriveVisionPresentedFrameChannelFacade } from "./presented_frame_channel.js";
 import { installDriveVisionHudLayoutFacade } from "./hud_layout.js";
 import { installDriveVisionHudCanvasFacade } from "./hud_canvas.js";
 import { installDriveVisionHudModelFacade } from "./hud_model.js";
@@ -14,6 +14,10 @@ import { installDriveVisionRoadOverlayGeometryRendererFacade } from "./road_over
 import { installDriveVisionRoadOverlayAuxRendererFacade } from "./road_overlay_aux_renderer.js";
 import { installDriveVisionRoadOverlayLeadModelFacade } from "./road_overlay_lead_model.js";
 import { installDriveVisionRoadOverlayLeadRendererFacade } from "./road_overlay_lead_renderer.js";
+import { installDriveVisionSessionPolicyFacade } from "./session_policy.js";
+import { installDriveVisionSessionControllerFacade } from "./session_controller.js";
+import { installDriveVisionConnectionTransactionFacade } from "./connection_transaction.js";
+import { installDriveVisionNetworkRecoveryFacade } from "./network_recovery.js";
 import { finalizeDriveVisionFacade } from "./facade.js";
 import {
   finalizeDriveVisionCompatibility,
@@ -29,18 +33,14 @@ export function installDriveVisionLeafFacades(target = globalThis, options = {})
   const existing = installedTargets.get(target);
   if (existing) return existing;
 
-  // Preserve the legacy boot contract: renderer exists before HUD content is
-  // created and mounted. HomeDrive is intentionally not required in this phase.
-  const hudRenderer = installDriveVisionHudRendererFacade(target);
-  const hudContent = installDriveVisionHudContentFacade(target, {
-    ...(options.hudContent || {}),
-    renderer: hudRenderer,
-  });
-  if (!hudRenderer || !hudContent) return null;
+  // HUD content owns activation/suppression and hands rendering to the Carrot HUD
+  // overlay. HomeDrive is intentionally not required in this phase.
+  const hudContent = installDriveVisionHudContentFacade(target, options.hudContent || {});
+  if (!hudContent) return null;
 
   const installed = Object.freeze({
-    hudRenderer,
     hudContent,
+    presentedFrames: installDriveVisionPresentedFrameChannelFacade(target),
     replayRenderBridge: installDriveVisionReplayRenderBridgeFacade(target),
     replayRenderController: installDriveVisionReplayRenderControllerFacade(target),
     hudLayout: installDriveVisionHudLayoutFacade(target),
@@ -53,6 +53,10 @@ export function installDriveVisionLeafFacades(target = globalThis, options = {})
     roadOverlayAuxRenderer: installDriveVisionRoadOverlayAuxRendererFacade(target),
     roadOverlayLeadModel: installDriveVisionRoadOverlayLeadModelFacade(target),
     roadOverlayLeadRenderer: installDriveVisionRoadOverlayLeadRendererFacade(target),
+    sessionPolicy: installDriveVisionSessionPolicyFacade(target),
+    sessionController: installDriveVisionSessionControllerFacade(target),
+    connectionTransactions: installDriveVisionConnectionTransactionFacade(target),
+    networkRecovery: installDriveVisionNetworkRecoveryFacade(target),
   });
   installedTargets.set(target, installed);
 
@@ -136,14 +140,18 @@ export * from "./hud_canvas.js";
 export * from "./hud_content.js";
 export * from "./hud_layout.js";
 export * from "./hud_model.js";
-export * from "./hud_renderer.js";
 export * from "./hud_rtc_perf.js";
 export * from "./registry_adapter.js";
 export * from "./replay_render_bridge.js";
 export * from "./replay_render_controller.js";
+export * from "./presented_frame_channel.js";
 export * from "./road_overlay_aux_renderer.js";
 export * from "./road_overlay_geometry_renderer.js";
 export * from "./road_overlay_lead_model.js";
 export * from "./road_overlay_lead_renderer.js";
 export * from "./road_overlay_policy.js";
 export * from "./road_overlay_projection.js";
+export * from "./connection_transaction.js";
+export * from "./network_recovery.js";
+export * from "./session_controller.js";
+export * from "./session_policy.js";

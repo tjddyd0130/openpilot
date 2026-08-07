@@ -14,7 +14,15 @@ from openpilot.selfdrive.carrot.carrot_navi_cereal import build_carrot_navi_payl
 CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
 sys.path.insert(0, str(CLUSTER_DIR))
 
-from cluster_config import RADAR_TO_CAMERA_M, VEHICLE_LENGTH_M
+from cluster_config import (
+  DARK_CLUSTER_THEME,
+  GREEN,
+  LIGHT_CLUSTER_THEME,
+  RADAR_TO_CAMERA_M,
+  RED,
+  VEHICLE_LENGTH_M,
+  WHITE,
+)
 from cluster_navi import fresh_carrot_navi, parse_carrot_navi, resolve_navi_speed_limit
 from cluster_navi_overlay import merge_navi_overlay_state
 from cluster_navi_source import (
@@ -37,8 +45,26 @@ from cluster_renderer import (
   DESIGN_WIDTH,
   LANE_TURN_SIGNAL_LEFT_CENTER_X,
   LANE_TURN_SIGNAL_RIGHT_CENTER_X,
+  NAV_STATUS_CENTER_X,
+  NAV_STATUS_CENTER_Y,
+  NAV_STATUS_FONT_SIZE,
   NAVI_LIVE_PANEL_X,
+  NAVI_MAP_BACKGROUND,
+  SIDE_GAUGE_COLUMN_GAP,
+  SIDE_GAUGE_LEFT_CENTER_X,
   SIDE_GAUGE_OUTLINE,
+  TPMS_STATUS_CAR_H,
+  TPMS_STATUS_CAR_W,
+  TPMS_STATUS_CAR_CENTER_Y,
+  TPMS_STATUS_CENTER_X,
+  TPMS_STATUS_COLUMN_OFFSET,
+  TPMS_STATUS_FONT_SIZE,
+  TPMS_STATUS_ICON_H,
+  TPMS_STATUS_ICON_W,
+  TPMS_STATUS_ROW_OFFSET,
+  TPMS_STATUS_VALUE_CENTER_Y,
+  TPMS_STATUS_WHEEL_H,
+  TPMS_STATUS_WHEEL_W,
   ClusterUiRenderer,
 )
 
@@ -580,6 +606,13 @@ def test_disconnected_dashboard_draws_system_panel(monkeypatch):
   }
 
 
+def test_dark_canvas_matches_navigation_backing_without_flattening_panels():
+  assert (*DARK_CLUSTER_THEME.bg, 255) == NAVI_MAP_BACKGROUND == (0, 0, 0, 255)
+  assert DARK_CLUSTER_THEME.panel_bg != DARK_CLUSTER_THEME.bg
+  assert DARK_CLUSTER_THEME.route_panel_bg != DARK_CLUSTER_THEME.bg
+  assert DARK_CLUSTER_THEME.route_video_bg != DARK_CLUSTER_THEME.bg
+
+
 def test_live_navi_guidance_media_is_scaled_up(monkeypatch):
   renderer = object.__new__(ClusterUiRenderer)
   frames = {
@@ -724,7 +757,7 @@ def test_ipc_media_source_restores_standalone_navigation_images():
   assert source._projected_media() == ()
 
 
-def test_navi_panel_shifts_3d_camera_modes_left():
+def test_navi_or_trip_report_panel_shifts_3d_camera_modes_left():
   renderer = object.__new__(ClusterUiRenderer)
   renderer.width = 1920
   renderer.screen_mode = 0
@@ -749,7 +782,7 @@ def test_navi_panel_shifts_3d_camera_modes_left():
     camera_view_mode=0,
     navi_live=None,
     navi_dashboard=None,
-  )) == 0
+  )) == 398
 
 
 def test_turn_signals_center_on_the_active_world_or_road_camera_content():
@@ -786,7 +819,7 @@ def test_turn_signals_center_on_the_active_world_or_road_camera_content():
     camera_view_mode=0,
     navi_live=None,
     navi_dashboard=None,
-  ), "left") == 0
+  ), "left") == pytest.approx(-398)
 
 
 def test_road_camera_ends_exactly_where_right_navigation_panel_begins():
@@ -824,15 +857,15 @@ def test_road_camera_cover_crop_retains_more_of_lower_frame():
   assert top_crop / (top_crop + bottom_crop) == pytest.approx(0.75)
 
 
-def test_road_camera_vehicle_ellipse_uses_vehicle_road_anchor(monkeypatch):
+def test_road_camera_vehicle_frame_uses_vehicle_road_anchor(monkeypatch):
   renderer = object.__new__(ClusterUiRenderer)
   projected = []
   monkeypatch.setattr(
     ClusterUiRenderer,
-    "_project_camera_overlay_point",
+    "_camera_overlay_screen_xy",
     lambda self, point, projection, scene_shift_x_m=0.0: (projected.append(point), None)[1],
   )
-  renderer._draw_camera_overlay_vehicle_coin(
+  renderer._draw_camera_overlay_vehicle_frame(
     SimpleNamespace(center=SimpleNamespace(x=0.0, y=10.0)),
     None,
     0.0,
@@ -857,25 +890,236 @@ def test_dark_theme_uses_visible_side_gauge_outlines(monkeypatch):
   assert renderer._side_gauge_outline(state) == SIDE_GAUGE_OUTLINE
 
 
-def test_road_camera_draws_compact_tpms_only(monkeypatch):
+def test_fuel_and_def_level_gauges_remain_enabled(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._current_theme = lambda: SimpleNamespace(
+    is_dark=True,
+    gauge_midline=(98, 112, 128),
+    muted=(150, 160, 172),
+  )
+  renderer._rounded_rect = lambda *args, **kwargs: None
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: None
+  level_gauges = []
+  renderer._draw_level_gauge = lambda *args, **kwargs: level_gauges.append(args)
+  monkeypatch.setattr("cluster_renderer.rl.draw_line_ex", lambda *args, **kwargs: None)
+  state = SimpleNamespace(
+    camera_view_mode=0,
+    accel_mps2=0.0,
+    fuel_gauge=0.64,
+    energy_gauge_label="fuel",
+    steering_output=None,
+    steering_output_normalized=None,
+    steering_output_kind=None,
+    urea_gauge=0.72,
+  )
+
+  renderer._draw_accel_block(state)
+  renderer._draw_steering_output_block(state)
+
+  assert [(gauge[0], gauge[5]) for gauge in level_gauges] == [
+    (SIDE_GAUGE_LEFT_CENTER_X, "fuel"),
+    (SIDE_GAUGE_LEFT_CENTER_X + SIDE_GAUGE_COLUMN_GAP, "DEF"),
+  ]
+
+
+@pytest.mark.parametrize("camera_view_mode", (0, 2))
+def test_default_and_road_camera_share_fixed_tpms_status(monkeypatch, camera_view_mode):
   renderer = object.__new__(ClusterUiRenderer)
   badges = []
+  rects = []
 
-  monkeypatch.setattr(ClusterUiRenderer, "_rounded_rect", lambda *args, **kwargs: None)
+  monkeypatch.setattr(ClusterUiRenderer, "_current_theme", lambda self: DARK_CLUSTER_THEME)
+  monkeypatch.setattr(
+    ClusterUiRenderer,
+    "_rounded_rect",
+    lambda self, *args, **kwargs: rects.append(args),
+  )
   monkeypatch.setattr(
     ClusterUiRenderer,
     "_draw_compact_tpms_value",
     lambda self, pressure, center_x, center_y: badges.append((pressure, center_x, center_y)),
   )
+  monkeypatch.setattr("cluster_renderer.rl.draw_line_ex", lambda *args, **kwargs: None)
   tpms = TpmsInfo(fl=35.0, fr=34.0, rl=33.0, rr=32.0)
 
-  renderer._draw_camera_tpms(SimpleNamespace(camera_view_mode=0, tpms=tpms))
-  assert badges == []
+  renderer._draw_tpms_status(SimpleNamespace(camera_view_mode=camera_view_mode, tpms=tpms))
 
-  renderer._draw_camera_tpms(SimpleNamespace(camera_view_mode=2, tpms=tpms))
-  assert [badge[0] for badge in badges] == [35.0, 34.0, 33.0, 32.0]
-  assert badges[0][1] < badges[1][1]
-  assert badges[0][2] < badges[2][2]
+  assert badges == [
+    (
+      35.0,
+      TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      34.0,
+      TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      33.0,
+      TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      32.0,
+      TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+    ),
+  ]
+  car_rect = next(rect for rect in rects if rect[2:4] == (TPMS_STATUS_CAR_W, TPMS_STATUS_CAR_H))
+  assert car_rect[0] + car_rect[2] * 0.5 == pytest.approx(TPMS_STATUS_CENTER_X)
+  assert car_rect[1] + car_rect[3] * 0.5 == pytest.approx(TPMS_STATUS_CAR_CENTER_Y)
+  wheel_rects = [rect for rect in rects if rect[2:4] == (TPMS_STATUS_WHEEL_W, TPMS_STATUS_WHEEL_H)]
+  assert len(wheel_rects) == 4
+  assert [(rect[0] + rect[2] * 0.5, rect[1] + rect[3] * 0.5) for rect in wheel_rects] == [
+    (
+      TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y - TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      TPMS_STATUS_CENTER_X - TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+    ),
+    (
+      TPMS_STATUS_CENTER_X + TPMS_STATUS_COLUMN_OFFSET,
+      TPMS_STATUS_VALUE_CENTER_Y + TPMS_STATUS_ROW_OFFSET,
+    ),
+  ]
+
+
+def test_tpms_status_draws_loaded_toy_car_texture_once(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._tpms_car_texture = SimpleNamespace(width=416, height=312)
+  texture_draws = []
+  badges = []
+  monkeypatch.setattr(
+    "cluster_renderer.rl.draw_texture_pro",
+    lambda *args: texture_draws.append(args),
+  )
+  monkeypatch.setattr(
+    ClusterUiRenderer,
+    "_draw_tpms_car_fallback",
+    lambda self: pytest.fail("fallback TPMS car drawn"),
+  )
+  monkeypatch.setattr(
+    ClusterUiRenderer,
+    "_draw_compact_tpms_value",
+    lambda self, pressure, center_x, center_y: badges.append((pressure, center_x, center_y)),
+  )
+
+  renderer._draw_tpms_status(SimpleNamespace(tpms=TpmsInfo(fl=35.0, fr=34.0, rl=33.0, rr=32.0)))
+
+  assert len(texture_draws) == 1
+  source = texture_draws[0][1]
+  destination = texture_draws[0][2]
+  assert (source.width, source.height) == (416.0, 312.0)
+  assert (destination.width, destination.height) == (TPMS_STATUS_ICON_W, TPMS_STATUS_ICON_H)
+  assert destination.x + destination.width * 0.5 == pytest.approx(TPMS_STATUS_CENTER_X)
+  assert destination.y + destination.height * 0.5 == pytest.approx(TPMS_STATUS_CAR_CENTER_Y)
+  assert len(badges) == 4
+
+
+def test_tpms_status_hides_when_all_pressures_are_missing(monkeypatch):
+  renderer = object.__new__(ClusterUiRenderer)
+  draws = []
+  monkeypatch.setattr(ClusterUiRenderer, "_rounded_rect", lambda self, *args, **kwargs: draws.append(args))
+  monkeypatch.setattr(
+    ClusterUiRenderer,
+    "_draw_compact_tpms_value",
+    lambda self, *args, **kwargs: draws.append(args),
+  )
+
+  renderer._draw_tpms_status(SimpleNamespace(tpms=TpmsInfo()))
+
+  assert draws == []
+
+
+@pytest.mark.parametrize(
+  ("theme", "pressure", "expected_text", "expected_color"),
+  (
+    (DARK_CLUSTER_THEME, 31.0, "31", WHITE),
+    (LIGHT_CLUSTER_THEME, 35.0, "35", WHITE),
+    (DARK_CLUSTER_THEME, 30.9, "31", RED),
+    (LIGHT_CLUSTER_THEME, None, "--", (170, 180, 188, 255)),
+  ),
+)
+def test_compact_tpms_value_uses_theme_and_low_pressure_color(
+  theme,
+  pressure,
+  expected_text,
+  expected_color,
+):
+  renderer = object.__new__(ClusterUiRenderer)
+  renderer._current_theme = lambda: theme
+  draws = []
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: draws.append((args, kwargs))
+
+  renderer._draw_compact_tpms_value(pressure, 100.0, 200.0)
+
+  assert draws == [(
+    (
+      expected_text,
+      100.0,
+      200.0,
+      TPMS_STATUS_FONT_SIZE,
+      expected_color,
+      (0, 0, 0, 255),
+      2,
+    ),
+    {"anchor": "center"},
+  )]
+
+
+@pytest.mark.parametrize(
+  ("external_nav_active", "navi_dashboard"),
+  (
+    (True, None),
+    (False, SimpleNamespace(connected=True)),
+  ),
+)
+def test_nav_status_is_centered_below_wifi_and_keeps_clock(
+  external_nav_active,
+  navi_dashboard,
+):
+  renderer = object.__new__(ClusterUiRenderer)
+  draws = []
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: draws.append((args, kwargs))
+  state = SimpleNamespace(
+    center_clock_text="12:34:56",
+    external_nav_active=external_nav_active,
+    navi_dashboard=navi_dashboard,
+  )
+
+  renderer._draw_center_clock(state)
+
+  assert draws[0][0][0] == "12:34:56"
+  assert draws[1] == ((
+    "NAV",
+    NAV_STATUS_CENTER_X,
+    NAV_STATUS_CENTER_Y,
+    NAV_STATUS_FONT_SIZE,
+    GREEN,
+    (10, 13, 16),
+    2,
+  ), {"anchor": "center", "cache": True})
+
+
+def test_nav_status_hides_without_external_navigation():
+  renderer = object.__new__(ClusterUiRenderer)
+  draws = []
+  renderer._draw_text_with_stroke = lambda *args, **kwargs: draws.append((args, kwargs))
+
+  renderer._draw_center_clock(SimpleNamespace(
+    center_clock_text=None,
+    external_nav_active=False,
+    navi_dashboard=None,
+  ))
+
+  assert draws == []
 
 
 def test_parser_accepts_direct_projection_dict():

@@ -174,12 +174,17 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ShowPathModeLane", {PERSISTENT, INT, "14"}},
     {"ShowPathColorLane", {PERSISTENT, INT, "13"}},
     {"ShowPlotMode", {PERSISTENT, INT, "0"}},
+    {"TimezoneName", {PERSISTENT, STRING, ""}},                // 로컬 타임존 IANA 이름 (예: "Asia/Seoul"), 앱/WiFi/GPS로 해석되면 기록
+    {"TimezoneSource", {PERSISTENT, STRING, ""}},              // 타임존 출처 우선순위 추적 ("app" > "wifi" > "gps")
+    {"CarrotTireTrajectory", {PERSISTENT, INT, "0"}},
     {"ShowCustomBrightness", {PERSISTENT, INT, "100"}},
     {"ShowModelView", {PERSISTENT, INT, "0"}},
+    {"ShowCameraWithCluster", {PERSISTENT, INT, "0"}},
     {"ClusterHud", {PERSISTENT, INT, "0"}},
     {"ClusterHudConnected", {CLEAR_ON_MANAGER_START, BOOL}},
     {"ClusterHudDebug", {PERSISTENT, INT, "0"}},
     {"ClusterHudBrightness", {PERSISTENT, INT, "0"}},
+    {"ClusterHudOrientation", {PERSISTENT, INT, "0"}},
     {"ClusterHudMirror", {PERSISTENT, INT, "0"}},
     {"ClusterHudEncoder", {PERSISTENT, INT, "0"}},
     {"ClusterHudCoreMode", {PERSISTENT, INT, "0"}},
@@ -190,6 +195,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"ClusterNaviMapFps", {PERSISTENT, INT, "1"}},
     {"ClusterHudLiveFps", {PERSISTENT, INT, "1"}},
     {"ClusterHudScreenMode", {PERSISTENT, INT, "0"}},
+    {"ClusterHudPanelLayout", {PERSISTENT, INT, "0"}},
     {"ClusterHudCameraViewMode", {PERSISTENT, INT, "0"}},
     {"ClusterHudRadarInfo", {PERSISTENT, INT, "4"}},
     {"ClusterHudRadarDisplay", {PERSISTENT, INT, "0"}},
@@ -282,7 +288,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"EnableRadarTracks", {PERSISTENT, INT, "0"}},
     {"RadarLatFactor", {PERSISTENT, INT, "0"}},
     {"EnableCornerRadar", {PERSISTENT, INT, "0"}},
-    {"RadarLeadModelMode", {PERSISTENT, INT, "0"}},
+    {"CarrotRadarMode", {PERSISTENT, INT, "0"}},
+    {"CarrotRadarCutInSensitivity", {PERSISTENT, INT, "3"}},
+    {"RadarMotionMode", {PERSISTENT, INT}},  // one-time migration to CarrotRadarMode
 
     {"EnableRadarTracksResult", {PERSISTENT | CLEAR_ON_MANAGER_START, INT}},
     {"CanParserResult", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},

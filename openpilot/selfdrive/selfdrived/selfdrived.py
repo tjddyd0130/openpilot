@@ -20,8 +20,10 @@ from openpilot.selfdrive.selfdrived.events import Events, ET
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
-from openpilot.selfdrive.controls.lib.latcontrol import MIN_LATERAL_CONTROL_SPEED
-from openpilot.selfdrive.controls.lib.cutin_alert import CutinAlertCandidate, CutinAlertTracker
+from openpilot.selfdrive.controls.lib.cutin_alert import (
+  CutinAlertCandidate,
+  CutinAlertTracker,
+)
 
 from openpilot.system.hardware import HARDWARE
 from openpilot.system.version import get_build_metadata
@@ -51,7 +53,7 @@ class SelfdriveD:
     self.params = Params()
 
     # Ensure the current branch is cached, otherwise the first cycle lags
-    build_metadata = get_build_metadata()
+    get_build_metadata()
 
     if CP is None:
       cloudlog.info("selfdrived is waiting for CarParams")
@@ -204,8 +206,9 @@ class SelfdriveD:
       )
       for lead in self.sm['radarState'].leadsCutIn
     ) if cutin_enabled else ()
-    if self.cutin_audio_tracker.update(cutin_candidates, cutin_enabled):
-      self.events.add(EventName.audioPrompt)
+    cutin_alert = self.cutin_audio_tracker.update(cutin_candidates, cutin_enabled)
+    if cutin_alert:
+      self.events.add(EventName.radarCutin)
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)

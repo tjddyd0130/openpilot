@@ -1,4 +1,7 @@
-from openpilot.selfdrive.controls.lib.cutin_alert import CutinAlertCandidate, CutinAlertTracker
+from openpilot.selfdrive.controls.lib.cutin_alert import (
+  CutinAlertCandidate,
+  CutinAlertTracker,
+)
 
 
 def candidate(track_id: int, d_rel: float, y_rel: float, v_rel: float = 0.0) -> CutinAlertCandidate:

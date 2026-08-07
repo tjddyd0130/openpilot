@@ -12,6 +12,8 @@ import pytest
 
 
 CLUSTER_DIR = Path(__file__).resolve().parents[1] / "cluster"
+CLUSTER_MAIN_PATH = CLUSTER_DIR / "main.py"
+LOGGERD_SCONSCRIPT = Path(__file__).resolve().parents[3] / "system" / "loggerd" / "SConscript"
 sys.path.insert(0, str(CLUSTER_DIR))
 
 from cluster_git_status import GitBranchStatusProvider
@@ -24,8 +26,24 @@ from cluster_h264_pipeline import (
   NATIVE_ACCESS_UNIT_QUEUE_MAX,
 )
 import cluster_renderer
+from cluster_live import standby_state
 from cluster_renderer import ClusterUiRenderer
 from cluster_usb_display import product_id_for_hud_mode
+
+
+def test_loggerd_builds_cluster_h264_bridges_on_tici():
+  source = LOGGERD_SCONSCRIPT.read_text(encoding="utf-8")
+
+  assert 'if arch in ("aarch64", "larch64"):' in source
+  assert "'cluster_h264_encoder_bridge'" in source
+  assert "'cluster_h264_decoder_bridge'" in source
+
+
+def test_managed_h264_orientation_change_requests_restart():
+  source = CLUSTER_MAIN_PATH.read_text(encoding="utf-8")
+
+  assert "if h264_pipeline is not None and hud_mode_watch is not None:" in source
+  assert "exiting for H264 restart" in source
 
 
 def test_tici_decoded_buffer_releases_fd_and_capture_lease_once():
@@ -88,6 +106,80 @@ def _import_cluster_autorun(monkeypatch):
   cluster_autorun = importlib.import_module(module_name)
   cluster_autorun._ensure_cluster_paths()
   return cluster_autorun
+
+
+def test_cluster_autorun_output_gate_preserves_debug_override(monkeypatch):
+  cluster_autorun = _import_cluster_autorun(monkeypatch)
+
+  class FakeParams:
+    def __init__(self, onroad, debug):
+      self.onroad = onroad
+      self.debug = debug
+
+    def get_bool(self, name):
+      assert name == cluster_autorun.IS_ONROAD_PARAM
+      return self.onroad
+
+    def get_int(self, name):
+      assert name == cluster_autorun.HUD_DEBUG_PARAM
+      return self.debug
+
+  assert not cluster_autorun._hud_output_allowed(FakeParams(False, 0))
+  assert cluster_autorun._hud_output_allowed(FakeParams(False, 1))
+  assert cluster_autorun._hud_output_allowed(FakeParams(True, 0))
+  assert cluster_autorun.HUD_CHECK_INTERVAL_S == 0.1
+
+
+def test_cluster_autorun_restarts_without_delay_after_orientation_change(monkeypatch):
+  cluster_autorun = _import_cluster_autorun(monkeypatch)
+  usb_display_module = importlib.import_module("cluster_usb_display")
+  values = {
+    cluster_autorun.HUD_PARAM: 1,
+    cluster_autorun.HUD_DEBUG_PARAM: 1,
+    cluster_autorun.HUD_ENCODER_PARAM: cluster_autorun.ENCODER_HARDWARE,
+    cluster_autorun.HUD_LIVE_FPS_PARAM: 1,
+    cluster_autorun.HUD_ORIENTATION_PARAM: 0,
+    cluster_autorun.HUD_CORE_MODE_PARAM: cluster_autorun.CORE_MODE_DEDICATED,
+    cluster_autorun.HUD_PRIORITY_PARAM: 10,
+  }
+  runs = []
+
+  class FakeParams:
+    def get_int(self, name):
+      return values[name]
+
+    def put_bool_nonblocking(self, _name, _value):
+      return None
+
+  def run_cluster_once(*_args, **_kwargs):
+    runs.append(values[cluster_autorun.HUD_ORIENTATION_PARAM])
+    if len(runs) == 1:
+      values[cluster_autorun.HUD_ORIENTATION_PARAM] = 2
+    else:
+      values[cluster_autorun.HUD_PARAM] = 0
+
+  monkeypatch.setattr(cluster_autorun, "Params", FakeParams)
+  monkeypatch.setattr(cluster_autorun, "_configure_autorun_locale", lambda: None)
+  monkeypatch.setattr(cluster_autorun, "_configure_autorun_affinity", lambda: None)
+  monkeypatch.setattr(cluster_autorun, "_apply_realtime_setting_env", lambda *_args: None)
+  monkeypatch.setattr(cluster_autorun, "_hud_output_allowed", lambda _params: True)
+  monkeypatch.setattr(cluster_autorun, "_run_cluster_once", run_cluster_once)
+  monkeypatch.setattr(
+    usb_display_module,
+    "find_supported_usb_product",
+    lambda expected_product_id: expected_product_id,
+  )
+  monkeypatch.setattr(
+    cluster_autorun.time,
+    "sleep",
+    lambda _seconds: pytest.fail("orientation restart must not wait for the retry delay"),
+  )
+
+  try:
+    cluster_autorun.main()
+    assert runs == [0, 2]
+  finally:
+    sys.modules.pop("openpilot.selfdrive.carrot.cluster_autorun", None)
 
 
 def _new_h264_pipeline() -> H264UsbPipeline:
@@ -169,6 +261,88 @@ def test_git_status_remote_disabled_never_starts_git_worker(tmp_path, monkeypatc
   assert provider.status().branch == "performance"
   assert provider.status().detail == ""
   assert provider._worker is None
+
+
+def test_git_status_remote_enabled_starts_background_refresh(tmp_path, monkeypatch):
+  git_dir = tmp_path / ".git"
+  git_dir.mkdir()
+  (git_dir / "HEAD").write_text("ref: refs/heads/navigation\n", encoding="utf-8")
+  provider = GitBranchStatusProvider(tmp_path)
+  refreshed = []
+  monkeypatch.setattr(provider, "_refresh", lambda: refreshed.append(True))
+
+  assert provider.status().branch == "navigation"
+  assert provider._worker is not None
+  provider._worker.join(timeout=1.0)
+  assert refreshed == [True]
+
+
+def test_lfa_icon_uses_active_color_rotation_and_c4_lane_overlay(monkeypatch):
+  renderer = ClusterUiRenderer()
+  inactive_texture = object()
+  active_texture = object()
+  lane_texture = object()
+  renderer._lfa_texture = inactive_texture
+  renderer._lfa_active_texture = active_texture
+  renderer._lfa_lane_texture = lane_texture
+  draws = []
+
+  def record_draw(texture, center_x, bottom_y, width, height, tint, alpha=None, rotation_deg=0.0):
+    draws.append((texture, center_x, bottom_y, width, height, tint, alpha, rotation_deg))
+    return texture is not None
+
+  monkeypatch.setattr(renderer, "_draw_bottom_aligned_texture_icon", record_draw)
+  state = replace(
+    standby_state(),
+    lfa_active=True,
+    steering_angle_deg=23.5,
+    active_lane_line=True,
+  )
+
+  renderer._draw_lfa_status_icon(state, 100.0)
+
+  assert draws[0][0] is active_texture
+  assert draws[0][7] == -23.5
+  assert draws[1][0] is lane_texture
+  assert draws[1][3] == cluster_renderer.LFA_STATUS_ICON_SIZE * 2.0
+  assert draws[1][7] == 0.0
+
+
+def test_lane_floor_keeps_blinking_after_physical_signal_ends(monkeypatch):
+  renderer = ClusterUiRenderer()
+  times = iter((100.0, 100.75, 101.0))
+  monkeypatch.setattr(cluster_renderer.time, "perf_counter", lambda: next(times))
+  state = replace(
+    standby_state(),
+    lane_change="left",
+    lane_change_phase="changing",
+    highlight_lane="left",
+    highlight_lane_offset=-1.0,
+    left_signal=False,
+  )
+
+  assert renderer._highlight_lane_lit(state, (False, False))
+  assert not renderer._highlight_lane_lit(state, (False, False))
+  assert renderer._highlight_lane_lit(state, (False, False))
+
+  idle = replace(state, lane_change=None, lane_change_phase="idle", highlight_lane=None, highlight_lane_offset=None)
+  renderer._highlight_lane_lit(idle, (False, False))
+  assert renderer._lane_highlight_side is None
+  assert renderer._lane_highlight_started_at is None
+
+
+def test_navi_screen_keeps_bottom_status_footer(monkeypatch):
+  renderer = ClusterUiRenderer(screen_mode=cluster_renderer.CLUSTER_SCREEN_MODE_NAVI)
+  calls = []
+  monkeypatch.setattr(cluster_renderer.rl, "rl_push_matrix", lambda: None)
+  monkeypatch.setattr(cluster_renderer.rl, "rl_scalef", lambda *_args: None)
+  monkeypatch.setattr(cluster_renderer.rl, "rl_pop_matrix", lambda: None)
+  monkeypatch.setattr(renderer, "_draw_navi_dashboard", lambda _state: calls.append("navi"))
+  monkeypatch.setattr(renderer, "_draw_status_footer", lambda _state: calls.append("footer"))
+
+  renderer._draw_hud(object(), (False, False))
+
+  assert calls == ["navi", "footer"]
 
 
 def test_renderer_fonts_use_bilinear_filter_without_mipmaps(tmp_path, monkeypatch):
