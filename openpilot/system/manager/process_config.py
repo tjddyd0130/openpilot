@@ -85,6 +85,17 @@ def dpath_radard(started: bool, params: Params, CP: car.CarParams) -> bool:
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
+# Wayon 원격 기능. /data/wayon_cloud/config.json 이 있을 때만 관련 프로세스가 뜬다.
+# 파일이 없으면 셋 다 기동하지 않으므로 설정 전에는 차량 동작에 아무 영향이 없다.
+WAYON_LIVE_ACTIVE_PATH = "/tmp/wayon_live.active"
+
+def wayon_remote_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return os.path.isfile("/data/wayon_cloud/config.json")
+
+# 뷰어가 접속하면 wayon_live_stream 이 이 파일을 만든다 -> 오프로드에서도 카메라를 켠다.
+def wayon_live_streaming(started: bool, params: Params, CP: car.CarParams) -> bool:
+  return os.path.isfile(WAYON_LIVE_ACTIVE_PATH)
+
 def enable_updated(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started and params.get_bool("SoftwareMenu")
 
@@ -157,7 +168,7 @@ procs = [
   NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
   # Preserve generic multi-camera WebRTC for notCar users. Carrot Vision on a
   # real device is road-only and remains gated by DisableDM == 2.
-  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], notcar),
+  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(notcar, wayon_live_streaming)),
   NativeProcess("carrot_vision_encoderd", "openpilot/system/loggerd", ["./encoderd", "--carrot-vision-road"], and_(iscar, enable_webrtc, carrot_vision_active)),
   NativeProcess("youtube_low_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-low"], and_(only_onroad, enable_youtube_low_encoder)),
   NativeProcess("youtube_medium_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-medium"], and_(only_onroad, enable_youtube_medium_encoder)),
@@ -165,7 +176,7 @@ procs = [
   NativeProcess("youtube_wide_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-wide"], and_(only_onroad, enable_youtube_wide_encoder)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
 
-  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
+  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, wayon_live_streaming), enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.tools.webcam.camerad", driverview, enabled=WEBCAM),
   PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
@@ -227,6 +238,13 @@ procs = [
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
   PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),
+
+  # Wayon 360 라이브 스트리밍 서버 (config.json 존재 시 상시 기동, 오프로드 뷰어 접속 처리)
+  PythonProcess("wayon_live", "openpilot.system.wayon_live_stream", wayon_remote_ready, restart_if_crash=True),
+  # Cloudflare 터널 supervisor 영구화 (재부팅 후에도 원격 라이브뷰 유지, 오프로드 전용은 스크립트가 처리)
+  PythonProcess("wayon_remote", "openpilot.system.wayon_remote", wayon_remote_ready, restart_if_crash=True),
+  # ID.4 배터리/위치 텔레메트리 -> Wayon Cloud (앱의 배터리 잔량·주차위치 표시용)
+  PythonProcess("wayon_telemetry", "openpilot.system.wayon_vehicle_telemetry", wayon_remote_ready, restart_if_crash=True),
 ]
 
 managed_processes = {p.name: p for p in procs}
