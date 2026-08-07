@@ -179,17 +179,25 @@ if [ "$want_tunnel" -eq 1 ]; then
   [ -n "$tunnel_token" ] || die "터널 토큰이 비어 있다"
 
   # 토큰은 {"a":계정,"t":터널ID,"s":비밀} JSON 의 base64 다. 디코딩해서 형태를 확인한다.
-  pad=$(( (4 - ${#tunnel_token} % 4) % 4 ))
-  padded="$tunnel_token$(printf '=%.0s' $(seq 0 $((pad - 1)) 2>/dev/null) 2>/dev/null)"
-  decoded="$(printf '%s' "$padded" | base64 -d 2>/dev/null || true)"
-  if [ -z "$decoded" ]; then
-    die "터널 토큰을 해석할 수 없다. 값이 잘렸거나 형식이 아니다.
-     대시보드 > 터널 > Add a connector 에 나오는 명령에서
-     'eyJhIjoi' 로 시작하는 문자열만 끝까지 복사하라."
-  fi
+  # base64url(-, _) 로 오는 경우도 있어 표준 알파벳으로 바꿔준다.
+  tok_norm="$(printf '%s' "$tunnel_token" | tr '_-' '/+')"
+  pad=$(( (4 - ${#tok_norm} % 4) % 4 ))
+  case "$pad" in 1) tok_norm="$tok_norm=" ;; 2) tok_norm="$tok_norm==" ;; 3) tok_norm="$tok_norm===" ;; esac
+  decoded="$(printf '%s' "$tok_norm" | base64 -d 2>/dev/null || true)"
   tok_tunnel_id="$(printf '%s' "$decoded" | sed -n 's/.*"t":"\([^"]*\)".*/\1/p')"
   if [ -z "$tok_tunnel_id" ]; then
-    die "터널 토큰에 터널 ID가 없다. 다른 종류의 값을 붙여넣었을 수 있다."
+    # 길이를 알려줘야 잘렸는지 판단할 수 있다. 정상 토큰은 보통 180자를 넘는다.
+    printf '\n' >&2
+    printf '  받은 토큰 길이: %d 자\n' "${#tunnel_token}" >&2
+    printf '  앞 12자: %.12s\n' "$tunnel_token" >&2
+    if [ "${#tunnel_token}" -lt 100 ]; then
+      die "터널 토큰이 너무 짧다. 붙여넣다가 잘린 것으로 보인다.
+     터미널에 직접 붙여넣지 말고 환경변수로 넘겨라:
+       export WAYON_TUNNEL_TOKEN=<토큰> && $0 --endpoint <주소> --tunnel"
+    fi
+    die "터널 토큰에서 터널 ID를 찾지 못했다.
+     대시보드 > 터널 > Add a connector 의 명령에서 'eyJhIjoi' 로 시작하는
+     문자열만 끝까지 복사했는지 확인하라."
   fi
   ok "터널 토큰 확인 (터널 ID: $tok_tunnel_id)"
 fi
