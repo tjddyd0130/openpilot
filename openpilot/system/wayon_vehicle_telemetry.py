@@ -329,7 +329,12 @@ def post_state(config: dict, payload: dict) -> bool:
       headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
       timeout=(10, 30),
     )
-    return 200 <= response.status_code < 300
+    if 200 <= response.status_code < 300:
+      return True
+    # 상태코드를 안 찍으면 401(토큰 불일치) 같은 실패가 조용히 묻혀 원인을 못 찾는다.
+    body = (response.text or "")[:200].replace("\n", " ")
+    print(f"Wayon telemetry: upload rejected HTTP {response.status_code} {body}", flush=True)
+    return False
   except requests.RequestException as exc:
     print(f"Wayon telemetry: upload failed: {exc}", flush=True)
     return False
