@@ -171,7 +171,27 @@ if [ "$want_tunnel" -eq 1 ]; then
     read -r -s tunnel_token
     printf '\n'
   fi
+  # 붙여넣기 사고가 잦다. 'cloudflared service install ' 접두어가 같이 들어오거나,
+  # 줄바꿈/공백이 끼거나, 끝이 잘리면 cloudflared 가
+  # "Unauthorized: Invalid tunnel secret" 으로 계속 거부당한다.
+  tunnel_token="$(printf '%s' "$tunnel_token" | tr -d '[:space:]')"
+  tunnel_token="${tunnel_token##*install}"   # 설치 명령을 통째로 붙여넣은 경우
   [ -n "$tunnel_token" ] || die "터널 토큰이 비어 있다"
+
+  # 토큰은 {"a":계정,"t":터널ID,"s":비밀} JSON 의 base64 다. 디코딩해서 형태를 확인한다.
+  pad=$(( (4 - ${#tunnel_token} % 4) % 4 ))
+  padded="$tunnel_token$(printf '=%.0s' $(seq 0 $((pad - 1)) 2>/dev/null) 2>/dev/null)"
+  decoded="$(printf '%s' "$padded" | base64 -d 2>/dev/null || true)"
+  if [ -z "$decoded" ]; then
+    die "터널 토큰을 해석할 수 없다. 값이 잘렸거나 형식이 아니다.
+     대시보드 > 터널 > Add a connector 에 나오는 명령에서
+     'eyJhIjoi' 로 시작하는 문자열만 끝까지 복사하라."
+  fi
+  tok_tunnel_id="$(printf '%s' "$decoded" | sed -n 's/.*"t":"\([^"]*\)".*/\1/p')"
+  if [ -z "$tok_tunnel_id" ]; then
+    die "터널 토큰에 터널 ID가 없다. 다른 종류의 값을 붙여넣었을 수 있다."
+  fi
+  ok "터널 토큰 확인 (터널 ID: $tok_tunnel_id)"
 fi
 
 info ""
