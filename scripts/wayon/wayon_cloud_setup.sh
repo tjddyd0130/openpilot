@@ -23,8 +23,11 @@
 # 아예 만나지 않는다. 배터리·주차위치·주행기록·스냅샷은 그대로 동작하고
 # 360 라이브뷰와 원격 SSH 만 빠진다. 나중에 터널을 붙이려면 다시 실행하면 된다.
 #
-# 생성한 시크릿은 Cloudflare 가 다시 보여주지 않으므로 wayon-secrets.txt 로 저장한다.
-# 이 파일에는 토큰이 평문으로 들어 있다. 안전한 곳에 보관하고 저장소에 커밋하지 마라.
+# 생성한 시크릿은 Cloudflare 가 다시 보여주지 않으므로, 이 스크립트를 실행한 위치에
+# wayon-secrets.txt 로 저장한다. 토큰이 평문으로 들어 있으니 안전하게 보관하라.
+#
+# 재실행해도 기존 시크릿을 그대로 쓴다. 새로 만들면 이미 설정한 기기·앱의 토큰이
+# 무효가 되어 갑자기 멈추기 때문이다. 일부러 바꾸려면 --rotate-secrets 를 준다.
 
 set -euo pipefail
 
@@ -35,7 +38,9 @@ db_name="wayon_cloud"
 kv_binding="WAYON_SNAPSHOTS"
 use_tunnel=1
 tunnel_id_arg=""
-secrets_out="wayon-secrets.txt"
+rotate_secrets=0
+# 시크릿은 실행한 위치에 남긴다. worker 디렉토리는 git 클론 안이라 실수로 커밋될 수 있다.
+secrets_out="$(pwd)/wayon-secrets.txt"
 
 step_no=0
 
@@ -57,6 +62,7 @@ while [ $# -gt 0 ]; do
     --tunnel-name) tunnel_name="${2:-}"; shift 2 ;;
     --tunnel-id)   tunnel_id_arg="${2:-}"; shift 2 ;;
     --no-tunnel)   use_tunnel=0; shift ;;
+    --rotate-secrets) rotate_secrets=1; shift ;;
     -h|--help)     usage ;;
     *) die "알 수 없는 인자: $1  (--help 참고)" ;;
   esac
@@ -259,9 +265,34 @@ rm -f "$deploy_log"
 [ -n "$endpoint" ] || endpoint="$(ask_value 'Worker 주소를 붙여넣어라 (https://....workers.dev)')"
 
 # -------------------------------------------------------------- 6. 시크릿
-step "시크릿 생성 및 등록"
+step "시크릿 준비 및 등록"
 gen() { openssl rand -hex 32; }
-UPLOAD_TOKEN="$(gen)"; VIEW_TOKEN="$(gen)"; LIVE_TOKEN="$(gen)"; SSH_SECRET="$(gen)"
+
+# 재실행 시 기존 시크릿을 그대로 쓴다. 새로 만들어버리면 이미 설정을 마친
+# 콤마 기기와 앱의 토큰이 전부 무효가 되어 갑자기 동작을 멈춘다.
+# 일부러 바꾸려면 --rotate-secrets 를 준다.
+read_secret() {  # read_secret <이름>
+  [ -f "$secrets_out" ] || return 1
+  sed -n "s/^$1=\(.*\)$/\1/p" "$secrets_out" | head -1
+}
+
+UPLOAD_TOKEN=""; VIEW_TOKEN=""; LIVE_TOKEN=""; SSH_SECRET=""
+if [ "$rotate_secrets" -eq 0 ] && [ -f "$secrets_out" ]; then
+  UPLOAD_TOKEN="$(read_secret WAYON_UPLOAD_TOKEN || true)"
+  VIEW_TOKEN="$(read_secret WAYON_VIEW_TOKEN || true)"
+  LIVE_TOKEN="$(read_secret WAYON_LIVE_TOKEN || true)"
+  SSH_SECRET="$(read_secret WAYON_SSH_SESSION_SECRET || true)"
+  if [ -n "$UPLOAD_TOKEN" ] && [ -n "$VIEW_TOKEN" ] && [ -n "$LIVE_TOKEN" ] && [ -n "$SSH_SECRET" ]; then
+    ok "기존 시크릿 재사용 ($secrets_out)"
+    info "새로 만들려면 --rotate-secrets 를 주라 (기기·앱 설정도 함께 바꿔야 한다)"
+  else
+    warn "기존 파일이 불완전하다. 빠진 값만 새로 만든다"
+  fi
+fi
+[ -n "$UPLOAD_TOKEN" ] || { UPLOAD_TOKEN="$(gen)"; ok "WAYON_UPLOAD_TOKEN 생성"; }
+[ -n "$VIEW_TOKEN" ]   || { VIEW_TOKEN="$(gen)";   ok "WAYON_VIEW_TOKEN 생성"; }
+[ -n "$LIVE_TOKEN" ]   || { LIVE_TOKEN="$(gen)";   ok "WAYON_LIVE_TOKEN 생성"; }
+[ -n "$SSH_SECRET" ]   || { SSH_SECRET="$(gen)";   ok "WAYON_SSH_SESSION_SECRET 생성"; }
 
 # 값은 stdin 으로만 넘긴다 (명령행/화면에 노출 금지).
 put_secret() {  # put_secret <이름> <값>
