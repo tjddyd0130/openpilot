@@ -186,7 +186,11 @@ ok "KV id 확보"
 step "wrangler.toml 작성"
 # 저장소에 커밋된 wrangler.toml 에는 원작자 계정의 ID 가 박혀 있고, 문서에 없는
 # [[vpc_services]] 블록도 들어 있다. 부분 수정 대신 새로 만든다.
-[ -f wrangler.toml ] && { cp -p wrangler.toml wrangler.toml.bak; info "기존 파일을 wrangler.toml.bak 으로 백업"; }
+# 재실행 시 원본 백업을 덮어쓰지 않는다 (한 번 생성한 toml 로 원본이 사라지는 것 방지)
+if [ -f wrangler.toml ] && [ ! -f wrangler.toml.bak ]; then
+  cp -p wrangler.toml wrangler.toml.bak
+  info "기존 파일을 wrangler.toml.bak 으로 백업"
+fi
 
 {
   printf 'name = "%s"\n' "$worker_name"
@@ -205,23 +209,56 @@ ok "작성 완료 ($([ "$use_tunnel" -eq 1 ] && echo 'VPC 바인딩 포함' || e
 
 # --------------------------------------------------------------- 4. 스키마
 step "D1 스키마 적용 (--remote)"
-npx --yes wrangler d1 execute "$db_name" --remote --file=./schema.sql \
-  || die "스키마 적용 실패"
+# wrangler 는 --remote 실행 전에 "Ok to proceed?" 를 되묻는다. Git Bash(MSYS) 처럼
+# TTY 가 온전치 않은 환경에서는 이 프롬프트 응답이 전달되지 않아 취소된다.
+# -y 로 확인을 건너뛰고, 이 플래그를 모르는 구버전이면 없이 한 번 더 시도한다.
+d1_exec() {  # d1_exec <sql파일>
+  npx --yes wrangler d1 execute "$db_name" --remote --file="$1" -y </dev/null 2>&1 \
+    || npx --yes wrangler d1 execute "$db_name" --remote --file="$1" </dev/null 2>&1
+}
+
+out="$(d1_exec ./schema.sql)" || { printf '%s\n' "$out"; die "스키마 적용 실패"; }
 ok "schema.sql"
 for m in migrations/*.sql; do
   [ -e "$m" ] || continue
-  npx --yes wrangler d1 execute "$db_name" --remote --file="$m" || die "마이그레이션 실패: $m"
+  out="$(d1_exec "$m")" || { printf '%s\n' "$out"; die "마이그레이션 실패: $m"; }
   ok "$(basename "$m")"
 done
 
-# -------------------------------------------------------------- 5. 시크릿
+# --------------------------------------------------------------- 5. 배포
+# 시크릿보다 배포를 먼저 한다. Worker 가 아직 없는 상태에서 'wrangler secret put' 을
+# 부르면 "그런 Worker 가 없다. 새로 만들까?" 를 되묻는데, Git Bash 처럼 TTY 가
+# 온전치 않은 환경에서는 그 프롬프트에 답할 수 없어 막힌다.
+# 시크릿은 배포 후에 넣어도 즉시 반영되므로 재배포가 필요 없다.
+step "배포"
+deploy_log="$(mktemp)"
+if npx --yes wrangler deploy </dev/null 2>&1 | tee "$deploy_log"; then
+  ok "배포 완료"
+else
+  if grep -q "10196" "$deploy_log"; then
+    die "code 10196 — API 토큰으로 배포를 시도했다.
+     unset CLOUDFLARE_API_TOKEN 후 'npx wrangler login' 으로 다시 하라.
+     (또는 --no-tunnel 로 실행하면 이 문제가 없다)"
+  fi
+  die "배포 실패. 위 로그를 확인하라"
+fi
+
+endpoint="$(grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' "$deploy_log" | head -1 || true)"
+rm -f "$deploy_log"
+[ -n "$endpoint" ] || endpoint="$(ask_value 'Worker 주소를 붙여넣어라 (https://....workers.dev)')"
+
+# -------------------------------------------------------------- 6. 시크릿
 step "시크릿 생성 및 등록"
 gen() { openssl rand -hex 32; }
 UPLOAD_TOKEN="$(gen)"; VIEW_TOKEN="$(gen)"; LIVE_TOKEN="$(gen)"; SSH_SECRET="$(gen)"
 
+# 값은 stdin 으로만 넘긴다 (명령행/화면에 노출 금지).
 put_secret() {  # put_secret <이름> <값>
-  printf '%s' "$2" | npx --yes wrangler secret put "$1" >/dev/null 2>&1 \
-    && ok "$1" || die "$1 등록 실패"
+  if printf '%s' "$2" | npx --yes wrangler secret put "$1" >/dev/null 2>&1; then
+    ok "$1"
+  else
+    die "$1 등록 실패. 수동으로:  npx wrangler secret put $1"
+  fi
 }
 put_secret WAYON_UPLOAD_TOKEN       "$UPLOAD_TOKEN"
 put_secret WAYON_VIEW_TOKEN         "$VIEW_TOKEN"
@@ -240,24 +277,6 @@ umask 077
 } > "$secrets_out"
 chmod 600 "$secrets_out"
 ok "$secrets_out 에 저장 (권한 600)"
-
-# --------------------------------------------------------------- 6. 배포
-step "배포"
-deploy_log="$(mktemp)"
-if npx --yes wrangler deploy 2>&1 | tee "$deploy_log"; then
-  ok "배포 완료"
-else
-  if grep -q "10196" "$deploy_log"; then
-    die "code 10196 — API 토큰으로 배포를 시도했다.
-     unset CLOUDFLARE_API_TOKEN 후 'npx wrangler login' 으로 다시 하라.
-     (또는 --no-tunnel 로 실행하면 이 문제가 없다)"
-  fi
-  die "배포 실패. 위 로그를 확인하라"
-fi
-
-endpoint="$(grep -oE 'https://[a-zA-Z0-9._-]+\.workers\.dev' "$deploy_log" | head -1 || true)"
-rm -f "$deploy_log"
-[ -n "$endpoint" ] || endpoint="$(ask_value 'Worker 주소를 붙여넣어라 (https://....workers.dev)')"
 
 # --------------------------------------------------------------- 마무리
 cat <<EOS
