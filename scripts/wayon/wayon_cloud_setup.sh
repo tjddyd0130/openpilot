@@ -219,10 +219,21 @@ d1_exec() {  # d1_exec <sql파일>
 
 out="$(d1_exec ./schema.sql)" || { printf '%s\n' "$out"; die "스키마 적용 실패"; }
 ok "schema.sql"
+
+# migrations/ 는 예전에 만든 DB 를 올리기 위한 것이라, 최신 schema.sql 로 새로 만든
+# DB 에는 이미 반영돼 있다. 0001 처럼 맨 ALTER TABLE ADD COLUMN 을 쓰는 파일은
+# "duplicate column name" 으로 실패하는데 이건 정상이므로 건너뛴다.
 for m in migrations/*.sql; do
   [ -e "$m" ] || continue
-  out="$(d1_exec "$m")" || { printf '%s\n' "$out"; die "마이그레이션 실패: $m"; }
-  ok "$(basename "$m")"
+  name="$(basename "$m")"
+  if out="$(d1_exec "$m")"; then
+    ok "$name"
+  elif printf '%s' "$out" | grep -qiE "duplicate column name|already exists"; then
+    ok "$name (이미 반영됨, 건너뜀)"
+  else
+    printf '%s\n' "$out"
+    die "마이그레이션 실패: $m"
+  fi
 done
 
 # --------------------------------------------------------------- 5. 배포
