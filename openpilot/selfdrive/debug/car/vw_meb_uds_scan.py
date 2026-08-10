@@ -134,7 +134,15 @@ def scan_ecus(panda, bus, rx_offset, timeout):
       continue
     label = next((d for a, d in TARGETS.values() if a == addr), "")
     found.append(addr)
-    print(f"  + 0x{addr:03X} 응답  {label}")
+    # 부품번호(F187)를 읽어 정체를 밝힌다. 주소만으로는 무슨 ECU인지 알 수 없다.
+    part = ""
+    try:
+      raw = client.read_data_by_identifier(0xF187)
+      part = raw.decode("utf-8", "replace").strip().rstrip("\x00")
+    except Exception:
+      pass
+    extra = f"  [{part}]" if part else ""
+    print(f"  + 0x{addr:03X} 응답  {label}{extra}")
   if not found:
     print("  응답한 ECU 없음")
   return found
@@ -160,6 +168,8 @@ def main():
                       help=f"응답 주소 오프셋 (기본 0x{RX_OFFSET:02X})")
   parser.add_argument("--scan-ecus", action="store_true",
                       help="DID 스캔 대신, 어떤 진단 주소가 응답하는지만 훑는다 (TesterPresent 만 송신)")
+  parser.add_argument("--obd", action="store_true",
+                      help="OBD 멀티플렉싱 켜기. 게이트웨이 뒤의 ECU(공조 등)는 이걸 켜야 닿는다")
   parser.add_argument("--bus", type=int, default=None, help="CAN 버스 지정. 기본은 0과 1을 자동 탐색")
   parser.add_argument("--full", action="store_true", help="0x0000-0xFFFF 전체 스캔")
   parser.add_argument("--start", type=lambda x: int(x, 0), default=None, help="스캔 시작 DID (예: 0x0100)")
@@ -193,6 +203,11 @@ def main():
 
   panda = Panda()
   panda.set_safety_mode(CarParams.SafetyModel.elm327)
+  # 게이트웨이 뒤의 ECU 는 OBD 멀티플렉싱을 켜야 닿는다. openpilot 펌웨어 조회도
+  # bus1 + obd_multiplexing=True 조합을 쓴다 (values.py FW_QUERY_CONFIG).
+  if args.obd:
+    panda.set_obd(True)
+    print("[OBD] 멀티플렉싱 ON\n")
   buses = [args.bus] if args.bus is not None else [0, 1]
 
   # --- ECU 탐색 모드: 누가 응답하는지만 보고 끝낸다 ---
