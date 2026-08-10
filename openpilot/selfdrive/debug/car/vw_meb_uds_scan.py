@@ -37,6 +37,7 @@ PROGRAMMING 세션(0x02)은 쓰지 않는다.
 import argparse
 import json
 import os
+import sys
 import time
 from datetime import datetime
 
@@ -140,6 +141,13 @@ def scan_ecus(panda, bus, rx_offset, timeout):
 
 
 def main():
+  # 파일로 리다이렉트하면 파이썬이 stdout 을 블록 버퍼링해서, 중간에 전원이 끊기거나
+  # 강제 종료되면 버퍼에 있던 결과가 통째로 사라진다. 차에서 돌리는 도구라 줄 단위로 흘린다.
+  try:
+    sys.stdout.reconfigure(line_buffering=True)
+  except Exception:
+    pass
+
   parser = argparse.ArgumentParser(
     description="VW MEB 전방 레이더(0x757)의 UDS DID를 읽기 전용으로 스캔한다.",
     epilog="차량 ACC ON / 시동 OFF / 정차 / openpilot 정지 상태에서 실행할 것. 쓰기는 하지 않는다.",
