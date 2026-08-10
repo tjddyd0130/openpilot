@@ -115,34 +115,51 @@ def open_session(panda, addr, rx_offset, bus, timeout):
 
 
 def scan_ecus(panda, bus, rx_offset, timeout):
-  """진단 주소 범위에 TesterPresent(0x3E)만 보내 응답하는 ECU 를 찾는다.
+  """진단 주소 범위를 훑어 응답하는 ECU 를 찾는다.
 
-  TesterPresent 는 세션을 바꾸지 않는 가장 무해한 UDS 서비스다. 어느 ECU 와
-  대화가 되는지부터 알아야 그다음 DID 스캔 대상을 정할 수 있다.
+  탐침은 두 가지를 쓴다.
+    1) F187(부품번호) 읽기 - openpilot 펌웨어 조회가 쓰는 방식과 같다.
+    2) TesterPresent      - 1번에 답하지 않는 ECU 대비.
+
+  TesterPresent 만 쓰면 놓치는 ECU 가 있다. 실제로 0x715(에어백)는 openpilot
+  핑거프린트가 F187 로 읽어오는데 TesterPresent 에는 응답하지 않았다.
+  부정응답(NRC)도 "거기 누가 있다" 는 뜻이므로 존재로 친다.
   """
   lo, hi = ECU_SCAN_RANGE
   found = []
-  print(f"[ECU 탐색] 버스 {bus}, 0x{lo:03X}-0x{hi:03X} 에 TesterPresent 송신")
+  print(f"[ECU 탐색] 버스 {bus}, 0x{lo:03X}-0x{hi:03X}  (F187 읽기 + TesterPresent)")
   for addr in range(lo, hi + 1):
     client = make_client(panda, addr, rx_offset, bus, timeout)
-    try:
-      client.tester_present()
-    except NegativeResponseError:
-      # 부정응답도 "거기 누가 있다" 는 뜻이다
-      pass
-    except Exception:
-      continue
-    label = next((d for a, d in TARGETS.values() if a == addr), "")
-    found.append(addr)
-    # 부품번호(F187)를 읽어 정체를 밝힌다. 주소만으로는 무슨 ECU인지 알 수 없다.
-    part = ""
+
+    present, part, how = False, "", ""
+    # 1) 부품번호 읽기. 성공하면 정체까지 같이 잡힌다.
     try:
       raw = client.read_data_by_identifier(0xF187)
       part = raw.decode("utf-8", "replace").strip().rstrip("\x00")
+      present, how = True, "F187"
+    except NegativeResponseError:
+      present, how = True, "F187(NRC)"
     except Exception:
       pass
+
+    # 2) 안 되면 TesterPresent 로 한 번 더
+    if not present:
+      try:
+        client.tester_present()
+        present, how = True, "TP"
+      except NegativeResponseError:
+        present, how = True, "TP(NRC)"
+      except Exception:
+        pass
+
+    if not present:
+      continue
+
+    found.append(addr)
+    label = next((d for a, d in TARGETS.values() if a == addr), "")
     extra = f"  [{part}]" if part else ""
-    print(f"  + 0x{addr:03X} 응답  {label}{extra}")
+    print(f"  + 0x{addr:03X} 응답({how})  {label}{extra}")
+
   if not found:
     print("  응답한 ECU 없음")
   return found
