@@ -81,7 +81,8 @@ ID.4는 2021년형부터 SFD(Schutz Fahrzeug Diagnose)가 걸려 있다. 두 군
 
 ## 6. 진행 계획
 
-- **0단계 (읽기 전용, 위험 없음).** `selfdrive/debug/car/vw_meb_radar_did_scan.py`.
+- **0단계 (읽기 전용, 위험 없음).** `openpilot/selfdrive/debug/car/vw_meb_uds_scan.py`
+  (`--target radar`, 예전 이름은 `vw_meb_radar_did_scan.py`).
   확장세션(0x03) 열고 `0x22`로 DID 대역을 훑어 존재하는 DID를 전부 덤프한다.
   부정응답 코드로 존재 여부가 갈리는 게 핵심이다.
   `0x31` = 없음, `0x33` = 있는데 잠김(SFD 후보, 가장 중요), `0x22`/`0x7E`/`0x7F` = 있는데 조건 불일치.
