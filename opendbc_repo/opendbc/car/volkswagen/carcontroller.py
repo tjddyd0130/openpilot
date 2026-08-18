@@ -51,6 +51,7 @@ class CarController(CarControllerBase):
     self.radar_disabled_warning_timer = 0
     self.hide_ea_error = False
     self.hold_release_frames = 0  # 정차잠금 해제 요청 유지 카운터 (핸드셰이크 중단 방지)
+    self.acc_hold_type_last = mebcan.ACC_HMS_NO_REQUEST  # 직전 ACC_Anforderung_HMS (0 직행 방지용)
 
   def update(self, CC, CS, now_nanos):
     actuators = CC.actuators
@@ -70,11 +71,13 @@ class CarController(CarControllerBase):
                                                        CS.out.vEgoRaw, CS.curvature,
                                                        self.CCP.STEER_STEP, CC.latActive,
                                                        self.CCP.CURVATURE_LIMITS)
-          # 조향 파워 계산 (운전자 개입 감지 시 감소). infiniteCable2와 동일하게 '부호 있는'
-          # steeringTorque 사용(abs 아님) -> 양(+) 방향 개입에서만 파워 감소하는 원본 거동 유지.
+          # 조향 파워 계산 (운전자 개입 감지 시 감소).
+          # infiniteCable2는 '부호 있는' steeringTorque를 그대로 np.interp에 넣어 음(-) 방향 개입에서는
+          # 항상 POWER_MAX로 클램프됐다 (한쪽 방향만 파워가 빠지는 좌우 비대칭).
+          # commaai/opendbc는 abs()를 쓴다 -> 양쪽 개입에 동일하게 반응하도록 수정.
           min_power = max(self.steering_power_last - self.CCP.STEERING_POWER_STEP, self.CCP.STEERING_POWER_MIN)
           max_power = min(self.steering_power_last + self.CCP.STEERING_POWER_STEP, self.CCP.STEERING_POWER_MAX)
-          target_power_driver = int(np.interp(CS.out.steeringTorque,
+          target_power_driver = int(np.interp(abs(CS.out.steeringTorque),
                                               [self.CCP.STEER_DRIVER_ALLOWANCE, self.CCP.STEER_DRIVER_MAX],
                                               [self.CCP.STEERING_POWER_MAX, self.CCP.STEERING_POWER_MIN]))
           target_power = int(np.interp(CS.out.vEgo, [0., 0.5], [self.CCP.STEERING_POWER_MIN, target_power_driver]))
@@ -181,6 +184,10 @@ class CarController(CarControllerBase):
           # startAccel=0.8이라 첫 프레임 통과 = 지연 없음)
           begin_release = (actuators.longControlState == LongCtrlState.pid
                            and CS.esp_hold_confirmation and accel >= 0.2)
+          # 차가 종방향 제어를 일시 거부 중이면(저속 급제동 직후) 출발요청을 넣지 않는다.
+          # 이 구간에 ACC_Anfahren 을 보내면 TSK 가 폴트난다. (commaai/opendbc)
+          if CS.long_control_inhibit:
+            begin_release = False
 
           # 요청은 차가 실제로 움직일 때까지 유지한다.
           # 이전 구현은 조건에 esp_hold_confirmation 이 들어 있어, 차가 해제에 응답해 홀드가
@@ -195,7 +202,7 @@ class CarController(CarControllerBase):
           if not CC.enabled or stopping or accel <= 0.0 or CS.out.vEgo > self.CCP.HOLD_RELEASE_DONE_SPEED:
             self.hold_release_frames = 0
 
-          starting = starting_planner or self.hold_release_frames > 0
+          starting = (starting_planner or self.hold_release_frames > 0) and not CS.long_control_inhibit
 
           # override / disable ramp handling to avoid EPB error at low speed (infiniteCable2)
           long_override = CC.cruiseControl.override or CS.out.gasPressed
@@ -205,8 +212,15 @@ class CarController(CarControllerBase):
           long_disabling = not CC.enabled and self.long_disabled_counter < 5
 
           acc_control = self.CCS.acc_control_value(CS.out.cruiseState.available, CS.out.accFaulted, CC.enabled, long_override)
+          # HALTEN(1)/ANFAHREN(4) -> KEINE_ANFORDERUNG(0) 직행은 차가 P 로 폴트난다 (commaai/opendbc).
+          # 직전에 홀드 계열을 보냈고 아직 HOLD_RELEASE_SPEED 미만이면 LOESEN_UEBER_RAMPE(5)를 거쳐 나간다.
+          releasing = (self.acc_hold_type_last in (self.CCS.ACC_HMS_HOLD, self.CCS.ACC_HMS_RELEASE,
+                                                   self.CCS.ACC_HMS_RAMP_RELEASE)
+                       and CS.out.vEgo < self.CCP.HOLD_RELEASE_SPEED)
           acc_hold = self.CCS.acc_hold_type(CS.out.cruiseState.available, CS.out.accFaulted, CC.enabled, starting, stopping,
-                                            CS.esp_hold_confirmation, long_override, long_override_begin, long_disabling)
+                                            CS.esp_hold_confirmation, long_override, long_override_begin, long_disabling,
+                                            releasing)
+          self.acc_hold_type_last = acc_hold
           # jerk/제어한계는 infiniteCable2 기본값(comfort OFF: jerk 4.0, 한계 0) 고정 - 실차 검증값.
           # (if2의 동적 comfort 모드는 출발 가속이 느려져 미채택; 필요 시 if2 mebutils에서 재이식)
           can_sends.extend(self.CCS.create_acc_accel_control(self.packer_pt, CANBUS.pt, self.CP, CS.acc_type, CC.enabled,
