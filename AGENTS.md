@@ -3,6 +3,28 @@
 - For long-running work, treat user questions, status checks, clarifications, and added in-scope
   requests as interruptions to answer while continuing the active work. Stop an active process or
   abandon the task only when the user explicitly asks to stop, cancel, pause, or replace it.
+- Every non-model change must be applied to `carrot-wip`, `carrot-cinque-terre`, and
+  `carrot-bmr_v6` and pushed to all three remote branches. Preserve each branch's model-specific
+  changes while integrating the complete `carrot-wip` history into both model branches, and verify
+  that none of the three branches has an unpushed commit before reporting the work complete.
+  Keep shared UI, model-name display helpers, and generated web assets identical across all three
+  branches; differences must be limited to model selection/artifacts, required model-specific
+  compatibility changes, and their tests.
+- When adding a model for testing, create a new experimental branch from the current `carrot-wip`.
+  Apply the same shared-code synchronization rule to the new model branch. Add any model-name
+  display support to the common code and generated web assets on every maintained branch.
+  A branch explicitly designated for a separate feature experiment may differ for that experiment;
+  the three current branches listed above remain model variants with otherwise identical features.
+- On this Windows workstation, vehicle tmux session captures are stored under
+  `\\DS1821P\openpilot\<branch>`. When tmux is mentioned, search the directory for the known
+  branch for a vehicle folder whose name ends with the exact dongle ID. If the branch is unknown,
+  search `\\DS1821P\openpilot` across branch directories for the exact dongle ID first. Do not
+  start by looking for a local Windows or WSL tmux installation.
+- Big-model ONNX files and manifests are hosted on the user's NAS under
+  `\\DS1821P\openpilot\models\<model-directory>`. Vehicles download the same files through
+  `https://upload.shind0.synology.me/models/<model-directory>/`. For a new big-model branch,
+  create a distinct model directory, place the verified ONNX and `manifest.json` there, and point
+  the branch at that NAS manifest. Do not use GitHub LFS as the vehicle download source.
 - Navigation deceleration behavior for the `origin/thftgr/navi-stream` branch is documented in
   `docs/carrot_navi_7713_7714_deceleration.md`.
 - The 7714-only control comparison between `origin/carrot-wip` and `origin/thftgr/navi-stream` is
@@ -33,12 +55,54 @@
 - Treat the JSON values as raw Params values; for example, `StoppingAccel` is stored in hundredths
   of m/s^2.
 
+# Vehicle route log lookup
+
+- On this Windows workstation, vehicle route logs are stored under `\\DS1821P\openpilot\routes`. Whenever
+  the user mentions an `rlog`, a route log, or a vehicle log, start by searching that share for a
+  vehicle directory whose name ends with the exact dongle ID or device ID. The vehicle directory
+  name identifies the car fingerprint; its child directories identify the route/segment numbers.
+  Do not start by searching the repository, tmux captures, or another route root.
+
+- A `Carrot Dashcam Upload` result is always uploaded under `\\DS1821P\openpilot\routes`. When the user
+  provides a `Carrot Dashcam Upload` block, resolve that local route first and do not start from
+  the remote result link, the repository, tmux captures, or another route root. Build the exact
+  preferred log path as
+  `\\DS1821P\openpilot\routes\<Car name> <DongleId>\<Result segment>\rlog.zst`.
+- Decode presentation escaping before building the path: Markdown `\_` is `_`, URL `%20` is a
+  space, and the result link's final directory name is the route segment.
+- If the exact path is absent, search `\\DS1821P\openpilot\routes` for a vehicle directory ending
+  in the exact dongle ID and then the exact result segment. Prefer `rlog.zst`; use `qlog.zst` only
+  when the full log is unavailable.
+- Treat Upload Time, Branch, and Commit as incident-analysis metadata, not as path components.
+
+# Vehicle rlog decoding
+
+- For full rlog analysis, use the full OpenPilot cereal schema. Prefer
+  `openpilot.tools.lib.logreader.LogReader`; do not use
+  `opendbc.car.logreader.LogReader(..., only_union_types=True)` to determine which services are
+  present. The opendbc reader loads the reduced `opendbc/car/rlog.capnp` schema and silently drops
+  services unknown to it, which can make `carState`, `carrotMan`, `navInstruction`,
+  `navInstructionCarrot`, `controlsState`, and `carControl` appear absent.
+- On Windows, if importing `openpilot.tools.lib.logreader` fails because of platform-only
+  dependencies such as `fcntl`, decompress the `.zst` file with `zstandard` and parse it directly
+  with `openpilot.cereal.log.Event.read_multiple_bytes`. Use `opendbc.car.logreader` only for an
+  intentionally CAN-only inspection.
+- Before reporting that a service is missing, count message types with the full cereal schema and
+  inspect at least one expected service value. When calculating segment-relative time, use the
+  first message of the analyzed service (for example `can` or `carState`) rather than `initData`,
+  whose boot-time timestamp can make later segments appear cumulatively longer.
+
 # User documentation policy
 
 - Do not create or edit files under `docs/user/ko/` or `docs/user/en/` unless the user explicitly
   requests user-documentation work. User-visible code changes alone do not authorize guide edits.
-- Keep setting-level explanations in the generated GitHub Wiki workflow and web-only explanations
-  in the localized UI instead of duplicating them into `docs/user/` by default.
+- The user has explicitly requested that every user-visible setting addition, removal, or behavior
+  change update the relevant Korean and English user guides in the same change. Treat setting work
+  as user-documentation work, keep the catalog summary and detailed guide synchronized with the
+  implementation, and run the user-docs validator.
+- Also keep setting-level explanations in the generated GitHub Wiki workflow. Keep explanations
+  specific to web-only features in the localized UI instead of duplicating web internals into
+  `docs/user/`.
 - `docs/user/docs_map.json` and `tools/docs/check_user_docs.py` are validation aids, not instructions
   to generate documentation. For an ordinary code pull request without explicitly requested docs,
   record a concrete `Docs-Not-Needed: <reason>` in the PR body when the workflow requires it.

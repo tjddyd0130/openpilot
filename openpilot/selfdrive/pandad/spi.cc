@@ -64,8 +64,10 @@ const unsigned int SPI_ACK_TIMEOUT = 500; // milliseconds
 const std::string SPI_DEVICE = "/dev/spidev0.0";
 // TODO: fix SPI turnaround synchronization at the protocol level.
 constexpr uint64_t SPI_PHASE_TURNAROUND_NS = 400000ULL;
-constexpr uint64_t SPI_INTER_TRANSACTION_NS = 1000000ULL;
+constexpr uint64_t SPI_CAN_INTER_TRANSACTION_NS = 400000ULL;
+constexpr uint64_t SPI_CONTROL_INTER_TRANSACTION_NS = 1000000ULL;
 static uint64_t spi_last_bus_activity_ns = 0;  // protected by hw_lock
+static uint64_t spi_next_transaction_ns = SPI_CAN_INTER_TRANSACTION_NS;  // protected by hw_lock
 
 static void wait_for_spi_turnaround(uint64_t start_ns, uint64_t turnaround_ns) {
   while ((nanos_since_boot() - start_ns) < turnaround_ns) {}
@@ -107,6 +109,44 @@ struct SpiPhaseDiagStats {
 static thread_local SpiAttemptTiming spi_attempt_timing;
 static std::mutex spi_phase_diag_lock;
 static SpiPhaseDiagStats spi_phase_diag[2];
+static std::mutex spi_error_event_lock;
+static PandaSpiErrorEvent latest_spi_error_event;
+static std::atomic<uint64_t> spi_error_event_sequence = 0U;
+
+static void record_panda_spi_error_event(uint8_t endpoint, uint32_t attempt, int result,
+                                         int final_result, uint32_t attempts, uint32_t recoveries,
+                                         uint16_t tx_len, uint16_t max_rx_len, unsigned int timeout_ms,
+                                         const SpiAttemptTiming &timing) {
+  std::lock_guard lk(spi_error_event_lock);
+  latest_spi_error_event.sequence++;
+  latest_spi_error_event.endpoint = endpoint;
+  latest_spi_error_event.attempt = attempt;
+  latest_spi_error_event.result = result;
+  latest_spi_error_event.final_result = final_result;
+  latest_spi_error_event.attempts = attempts;
+  latest_spi_error_event.recoveries = recoveries;
+  latest_spi_error_event.tx_len = tx_len;
+  latest_spi_error_event.max_rx_len = max_rx_len;
+  latest_spi_error_event.timeout_ms = timeout_ms;
+  latest_spi_error_event.phase = spi_failure_phase_name(timing.failure_phase);
+  latest_spi_error_event.lock_us = timing.lock_us;
+  latest_spi_error_event.turnaround_us = timing.turnaround_us;
+  latest_spi_error_event.hack_us = timing.hack_us;
+  latest_spi_error_event.dack_us = timing.dack_us;
+  latest_spi_error_event.recovery_us = timing.recovery_us;
+  latest_spi_error_event.total_us = timing.total_us;
+  latest_spi_error_event.recovery_restarts = timing.recovery_restarts;
+  spi_error_event_sequence.store(latest_spi_error_event.sequence, std::memory_order_release);
+}
+
+PandaSpiErrorEvent get_latest_panda_spi_error_event() {
+  std::lock_guard lk(spi_error_event_lock);
+  return latest_spi_error_event;
+}
+
+uint64_t get_panda_spi_error_sequence() {
+  return spi_error_event_sequence.load(std::memory_order_acquire);
+}
 
 static int spi_phase_diag_index(uint8_t endpoint) {
   if (endpoint == 0x03U) return 0;
@@ -418,6 +458,7 @@ int PandaSpiHandle::spi_transfer_retry(uint8_t endpoint, uint8_t *tx_data, uint1
   uint64_t recovery_max_us = 0U;
   SpiAttemptTiming first_failure_timing = {};
   SpiAttemptTiming last_failure_timing = {};
+  int first_failure_result = 0;
 
   do {
     ret = spi_transfer(endpoint, tx_data, tx_len, rx_data, max_rx_len, timeout);
@@ -430,6 +471,7 @@ int PandaSpiHandle::spi_transfer_retry(uint8_t endpoint, uint8_t *tx_data, uint1
     if (ret < 0) {
       if (total_recoveries == 0U) {
         first_failure_timing = spi_attempt_timing;
+        first_failure_result = ret;
       }
       last_failure_timing = spi_attempt_timing;
       total_recoveries++;
@@ -475,6 +517,11 @@ int PandaSpiHandle::spi_transfer_retry(uint8_t endpoint, uint8_t *tx_data, uint1
 
   // Log after the retry sequence so diagnostics never delay a recovery attempt.
   if (total_recoveries > 0U) {
+    // Publish only after retry completion so alerting can distinguish a recovered
+    // transient from a terminal transfer failure.
+    record_panda_spi_error_event(endpoint, 1U, first_failure_result,
+                                 ret, attempts, total_recoveries,
+                                 tx_len, max_rx_len, timeout, first_failure_timing);
     LOGW("spi_failure_diag: endpoint=0x%x, attempts=%u, final_ret=%d"
          ", hack_nacks=%u, dack_nacks=%u, ack_timeouts=%u, host_checksums=%u"
          ", other_failures=%u, first_phase=%s, last_phase=%s"
@@ -579,6 +626,9 @@ int PandaSpiHandle::spi_transfer(uint8_t endpoint, uint8_t *tx_data, uint16_t tx
   int ret;
   uint16_t rx_data_len;
   const uint64_t attempt_start_ns = nanos_since_boot();
+  // Keep this before every path that can jump to fail.
+  const bool safety_mode_control = (endpoint == 0U) && (tx_data != nullptr) &&
+                                   (tx_len >= sizeof(ControlPacket_t)) && (tx_data[0] == 0xdcU);
   uint64_t phase_start_ns = 0U;
   spi_attempt_timing = {};
   LockEx lock(spi_fd, hw_lock, endpoint);
@@ -590,9 +640,11 @@ int PandaSpiHandle::spi_transfer(uint8_t endpoint, uint8_t *tx_data, uint16_t tx
 
   phase_start_ns = nanos_since_boot();
   // Panda must re-arm its header RX DMA between independent transactions.
-  // The 400 us protocol minimum is marginal when pandad threads queue on the
-  // shared bus, so leave a full millisecond after the previous bus activity.
-  wait_for_spi_turnaround(spi_last_bus_activity_ns, SPI_INTER_TRANSACTION_NS);
+  // Keep the normal CAN path at the protocol minimum. Control transfers get
+  // extra setup time, and a safety-mode change also protects the next transfer.
+  wait_for_spi_turnaround(spi_last_bus_activity_ns,
+                          std::max(spi_next_transaction_ns,
+                                   endpoint == 0U ? SPI_CONTROL_INTER_TRANSACTION_NS : SPI_CAN_INTER_TRANSACTION_NS));
   spi_attempt_timing.turnaround_us += (nanos_since_boot() - phase_start_ns) / 1000U;
 
   xfer_count++;
@@ -684,6 +736,7 @@ int PandaSpiHandle::spi_transfer(uint8_t endpoint, uint8_t *tx_data, uint16_t tx
   }
 
   spi_last_bus_activity_ns = nanos_since_boot();
+  spi_next_transaction_ns = safety_mode_control ? SPI_CONTROL_INTER_TRANSACTION_NS : SPI_CAN_INTER_TRANSACTION_NS;
   spi_attempt_timing.total_us = (spi_last_bus_activity_ns - attempt_start_ns) / 1000U;
   return rx_data_len;
 
@@ -703,6 +756,7 @@ fail:
   spi_attempt_timing.recovery_us = (nanos_since_boot() - phase_start_ns) / 1000U;
 
   spi_last_bus_activity_ns = nanos_since_boot();
+  spi_next_transaction_ns = SPI_CAN_INTER_TRANSACTION_NS;
   spi_attempt_timing.total_us = (spi_last_bus_activity_ns - attempt_start_ns) / 1000U;
   if (ret >= 0) ret = -1;
   return ret;
