@@ -7,7 +7,7 @@ from opendbc.can import CANParser
 from opendbc.car import Bus
 from opendbc.car.hyundai.carstate import (
   CANFD_HDA_INFO_MSG, CANFD_NAVI_PROFILE_MSG, CANFD_NAVI_STATUS_MSG, CarState,
-  VEHICLE_NAVI_POSITION_TIMEOUT_NS, VEHICLE_NAVI_SCHOOL_ZONE_MAX_DISTANCE,
+  VEHICLE_NAVI_POSITION_TIMEOUT_NS, VEHICLE_NAVI_ROUTE_TIMEOUT_NS, VEHICLE_NAVI_SCHOOL_ZONE_MAX_DISTANCE,
   VEHICLE_SPEED_CAMERA_PARAM_UPDATE_FRAMES, is_canfd_navi_camera_active,
 )
 from opendbc.car.hyundai.values import CAR, HyundaiFlags
@@ -24,11 +24,11 @@ class FakeParams:
     if key == "VehicleSpeedCameraDistanceTime":
       self.read_count += 1
       return self.value
+    if key == "VehicleNaviCanControl":
+      return int(self.vehicle_navi)
     raise KeyError(key)
 
   def get_bool(self, key):
-    if key == "VehicleNaviCanControl":
-      return self.vehicle_navi
     assert key == "VehicleNaviSchoolZoneControl"
     return self.school_zone
 
@@ -47,6 +47,8 @@ def _car_state(distance_time_tenths=60):
   state.vehicleNaviProfileTimestamp = 0
   state.vehicleNaviAvailable = False
   state.vehicleNaviRouteResetTimestamp = 0
+  state.vehicleNaviRouteState = 0
+  state.vehicleNaviRoutePathIndex = None
   state.vehicleNaviRoadClass = 7
   state.vehicleNaviCameraTarget = None
   state.vehicleNaviCameraStatusEvent = None
@@ -56,6 +58,9 @@ def _car_state(distance_time_tenths=60):
   state.vehicleNaviSchoolZoneStartDistance = 0.0
   state.vehicleNaviSchoolZoneUsesCameraStatus = False
   state.vehicleNaviZoneControlSupported = True
+  state.canfd_wrapped_navi = False
+  state.pv5_section_start_prev = False
+  state.is_metric = True
   state.navi_profile_msg = "NEW_MSG_4BE"
   state.navi_segment_4b9 = None
   state.navi_position_4b4 = None
@@ -224,10 +229,11 @@ def test_vehicle_navi_profile_decodes_labeled_speed_bump_frame():
     "PROLONG_OFFSET": (value >> 32) & 0x1fff,
     "PROLONG_CYCLIC_COUNTER": (value >> 45) & 0x3,
     "PROLONG_UPDATE": (value >> 47) & 0x1,
+    "PROLONG_PATH_INDEX": (value >> 48) & 0x3f,
     "PROLONG_PROFILE_TYPE": (value >> 54) & 0x1f,
   })
 
-  assert profile == {"value": 6, "offset": 890, "counter": 3, "update": 1, "profile_type": 16}
+  assert profile == {"value": 6, "offset": 890, "counter": 3, "update": 1, "path_index": 8, "profile_type": 16}
   assert CarState._classify_vehicle_navi_profile(profile) == ("bump", 0, 6)
 
 
@@ -238,6 +244,93 @@ def test_vehicle_navi_segment_decodes_functional_road_class():
   })
 
   assert segment == {"offset": 123, "path_index": 0, "calculated_route": 1, "functional_road_class": 1}
+
+
+# 00000f07--e42270f2b5--2 reported the false bump as route state 0 with
+# segment/profile path 8. Modes 2 and 3 must reject that combination.
+@pytest.mark.parametrize(("mode", "value", "route_state", "segment_path", "profile_path", "expected"), (
+  (1, 6, 0, 8, 8, True),
+  (2, 0xB1, 0, 8, 8, True),
+  (2, 6, 0, 8, 8, False),
+  (2, 6, 1, 8, 8, True),
+  (2, 6, 1, 8, 9, False),
+  (3, 0xB1, 0, 8, 8, False),
+  (3, 0xB1, 1, 8, 8, True),
+  (3, 6, 1, 8, 8, True),
+))
+def test_vehicle_navi_control_mode_filters_profiles_by_calculated_route(
+    mode, value, route_state, segment_path, profile_path, expected,
+):
+  state = _car_state()
+  state.vehicleNaviCanControl = mode
+  segment_raw = (segment_path << 13) | (route_state << 22) | (6 << 24)
+  state.navi_segment_4b9 = {
+    f"BYTE_{i + 1}": byte for i, byte in enumerate(segment_raw.to_bytes(8, "little"))
+  }
+  state.navi_profile_4be = {
+    "PROLONG_VALUE": value,
+    "PROLONG_OFFSET": 300,
+    "PROLONG_CYCLIC_COUNTER": 3,
+    "PROLONG_UPDATE": 1,
+    "PROLONG_PATH_INDEX": profile_path,
+    "PROLONG_PROFILE_TYPE": 16,
+  }
+  cp = SimpleNamespace(ts_nanos={
+    "NEW_MSG_4B9": {"BYTE_1": 1},
+    "NEW_MSG_4BE": {"PROLONG_VALUE": 2},
+  })
+  ret = SimpleNamespace(speedLimit=0.0, speedBumpDistance=0.0, schoolZoneActive=False)
+
+  state._update_vehicle_navi_events(cp, ret, False)
+
+  assert bool(state.vehicleNaviEvents) is expected
+  if value == 6:
+    assert (ret.speedBumpDistance > 0) is expected
+  else:
+    assert (ret.vehicleNaviSpeed > 0) is expected
+
+
+@pytest.mark.parametrize(("mode", "remaining_types"), (
+  (2, {"camera"}),
+  (3, set()),
+))
+def test_vehicle_navi_leaving_calculated_route_clears_route_filtered_events(mode, remaining_types):
+  state = _car_state()
+  state.vehicleNaviCanControl = mode
+  state.vehicleNaviRouteState = 1
+  state.vehicleNaviRoutePathIndex = 8
+  state.vehicleNaviEvents = [
+    {"type": "camera", "speed": 50, "kind": 1, "target": 300.0},
+    {"type": "bump", "speed": 0, "kind": 6, "target": 200.0},
+  ]
+  segment_raw = (8 << 13) | (0 << 22) | (6 << 24)
+  state.navi_segment_4b9 = {
+    f"BYTE_{i + 1}": byte for i, byte in enumerate(segment_raw.to_bytes(8, "little"))
+  }
+  cp = SimpleNamespace(ts_nanos={"NEW_MSG_4B9": {"BYTE_1": 1}})
+  ret = SimpleNamespace(speedLimit=0.0, speedBumpDistance=0.0, schoolZoneActive=False)
+
+  state._update_vehicle_navi_events(cp, ret, False)
+
+  assert {event["type"] for event in state.vehicleNaviEvents} == remaining_types
+
+
+def test_vehicle_navi_stale_calculated_route_rejects_route_filtered_bump():
+  state = _car_state()
+  state.vehicleNaviCanControl = 2
+  state.vehicleNaviRouteState = 1
+  state.vehicleNaviRoutePathIndex = 8
+  state.vehicleNaviSegmentTimestamp = 1_000_000_000
+  state.vehicleNaviEvents = [{"type": "bump", "speed": 0, "kind": 6, "target": 200.0}]
+  cp = SimpleNamespace(ts_nanos={}, _last_update_nanos=1_000_000_000 + VEHICLE_NAVI_ROUTE_TIMEOUT_NS + 1)
+  ret = SimpleNamespace(speedLimit=0.0, speedBumpDistance=0.0, schoolZoneActive=False)
+
+  state._update_vehicle_navi_events(cp, ret, False)
+
+  assert state.vehicleNaviRouteState == 0
+  assert state.vehicleNaviRoutePathIndex is None
+  assert state.vehicleNaviEvents == []
+  assert ret.speedBumpDistance == 0
 
 
 def test_vehicle_navi_route_recalculation_clears_events():
@@ -580,14 +673,14 @@ def test_pv5_canfd_navi_dbc_decodes_logged_frames():
   assert hda_info["MapSource"] == 2
 
   profile = CarState._decode_vehicle_navi_profile(parser.vl[CANFD_NAVI_PROFILE_MSG])
-  assert profile == {"value": 0xB0, "offset": 1996, "counter": 3, "update": 1, "profile_type": 16}
+  assert profile == {"value": 0xB0, "offset": 1996, "counter": 3, "update": 1, "path_index": 8, "profile_type": 16}
   assert CarState._classify_vehicle_navi_profile(profile) == ("camera", 50, 0)
 
   parser.update([1_010_000_000, [
     (0x093, bytes.fromhex("c27c44ffffffffff060000007ae30814ffffffffffffffff"), 0),
   ]])
   bump = CarState._decode_vehicle_navi_profile(parser.vl[CANFD_NAVI_PROFILE_MSG])
-  assert bump == {"value": 6, "offset": 890, "counter": 3, "update": 1, "profile_type": 16}
+  assert bump == {"value": 6, "offset": 890, "counter": 3, "update": 1, "path_index": 8, "profile_type": 16}
   assert CarState._classify_vehicle_navi_profile(bump) == ("bump", 0, 6)
 
 
@@ -653,6 +746,104 @@ def test_pv5_canfd_navi_ignores_unverified_speed_limit_zones():
   assert not state.vehicleNaviSpeedZoneActive
   assert not state.vehicleNaviSchoolZoneActive
   assert not ret.vehicleNaviActive
+
+
+# Raw 2026-09-07 PV5 frames: section approach, announcement, and early exit.
+PV5_SECTION_HDA = bytes.fromhex("5ef6be000000000041509a1100000100")
+PV5_SECTION_LOW = bytes.fromhex("80a5d30001000000000000325010f1000000000000000000")
+PV5_SECTION_HIGH = bytes.fromhex("b99cdd0001000000000010325010f1000000000000000000")
+PV5_SECTION_EXIT_HDA = bytes.fromhex("ec0d040000000000521e9a0940000100")
+PV5_SECTION_EXIT = bytes.fromhex("ba962c0001000000000000320010f1000000000000000000")
+
+
+def _pv5_section_state():
+  state = _car_state()
+  state.canfd_wrapped_navi = True
+  state.vehicleNaviZoneControlSupported = False
+  state.vehicleNaviCanControl = True
+  state.navi_profile_msg = CANFD_NAVI_PROFILE_MSG
+  cp = CANParser("hyundai_canfd_generated", [(CANFD_HDA_INFO_MSG, math.nan)], 0)
+  alt = CANParser("hyundai_canfd_generated", [(CANFD_NAVI_STATUS_MSG, math.nan)], 1)
+  state.hda_info_4a3 = cp.vl[CANFD_HDA_INFO_MSG]
+  state.navi_status_380 = alt.vl[CANFD_NAVI_STATUS_MSG]
+  return state, cp, alt
+
+
+def _pv5_section_step(state, cp, alt, t, status=PV5_SECTION_LOW, hda=PV5_SECTION_HDA):
+  cp.update([int(t * 1e9), [] if hda is None else [(0x364, hda, 0)]])
+  alt.update([int(t * 1e9), [] if status is None else [(0x380, status, 1)]])
+  ret = SimpleNamespace(speedLimit=80.0)
+  state._update_vehicle_navi_events(cp, ret, False, alt)
+  return ret
+
+
+def test_pv5_section_latches_through_alert_end_and_repeated_alert_then_exits():
+  state, cp, alt = _pv5_section_state()
+  assert not _pv5_section_step(state, cp, alt, 1).vehicleNaviSectionActive
+  ret = _pv5_section_step(state, cp, alt, 1.1, PV5_SECTION_HIGH)
+  assert ret.vehicleNaviAvailable and ret.vehicleNaviActive and ret.vehicleNaviSectionActive
+  assert ret.vehicleNaviSpeed == 80
+  assert state.navi_status_380["SECTION_ALERT"] == 1
+  assert not is_canfd_navi_camera_active(state.navi_status_380)
+  # Fresh messages throughout a section, including another five-second alert.
+  for i in range(12, 200):
+    status = PV5_SECTION_HIGH if 100 <= i < 150 else PV5_SECTION_LOW
+    ret = _pv5_section_step(state, cp, alt, i / 10, status)
+    assert ret.vehicleNaviSectionActive and ret.vehicleNaviSpeed == 80
+  ret = _pv5_section_step(state, cp, alt, 20, PV5_SECTION_EXIT, PV5_SECTION_EXIT_HDA)
+  assert not ret.vehicleNaviSectionActive and not ret.vehicleNaviActive
+  # The old limit returning after exit is insufficient to start another zone.
+  assert not _pv5_section_step(state, cp, alt, 20.1).vehicleNaviSectionActive
+
+
+@pytest.mark.parametrize("status,hda", [(None, PV5_SECTION_HDA), (PV5_SECTION_HIGH, None), (None, None)])
+def test_pv5_section_releases_on_message_loss_and_requires_new_edge(status, hda):
+  state, cp, alt = _pv5_section_state()
+  _pv5_section_step(state, cp, alt, 1)
+  assert _pv5_section_step(state, cp, alt, 1.1, PV5_SECTION_HIGH).vehicleNaviSectionActive
+  assert not _pv5_section_step(state, cp, alt, 2.2, status, hda).vehicleNaviSectionActive
+  assert not _pv5_section_step(state, cp, alt, 2.3, PV5_SECTION_HIGH).vehicleNaviSectionActive
+  _pv5_section_step(state, cp, alt, 2.4)
+  assert _pv5_section_step(state, cp, alt, 2.5, PV5_SECTION_HIGH).vehicleNaviSectionActive
+
+
+def test_pv5_section_setting_disabled_and_reenabled_requires_new_alert():
+  state, cp, alt = _pv5_section_state()
+  _pv5_section_step(state, cp, alt, 1)
+  assert _pv5_section_step(state, cp, alt, 1.1, PV5_SECTION_HIGH).vehicleNaviSectionActive
+  state.vehicleNaviCanControl = False
+  assert not _pv5_section_step(state, cp, alt, 1.2, PV5_SECTION_HIGH).vehicleNaviSectionActive
+  state.vehicleNaviCanControl = True
+  assert not _pv5_section_step(state, cp, alt, 1.3, PV5_SECTION_HIGH).vehicleNaviSectionActive
+  _pv5_section_step(state, cp, alt, 1.4)
+  assert _pv5_section_step(state, cp, alt, 1.5, PV5_SECTION_HIGH).vehicleNaviSectionActive
+
+
+@pytest.mark.parametrize("speed,map_source", [(0, 2), (30, 2), (255, 2), (80, 1), (50, 2)])
+def test_pv5_section_rejects_invalid_or_disagreeing_limits(speed, map_source):
+  state, cp, alt = _pv5_section_state()
+  hda = bytearray(PV5_SECTION_HDA)
+  hda[9] = speed
+  hda[11] = (hda[11] & ~0x38) | (map_source << 3)
+  _pv5_section_step(state, cp, alt, 1)
+  assert not _pv5_section_step(state, cp, alt, 1.1, PV5_SECTION_HIGH, bytes(hda)).vehicleNaviSectionActive
+
+
+def test_pv5_section_does_not_start_from_spot_camera_or_other_alert():
+  state, cp, alt = _pv5_section_state()
+  for i, (camera, alert) in enumerate([(0, 0), (0x40, 0), (4, 0), (0, 2)]):
+    status = bytearray(PV5_SECTION_LOW)
+    status[3], status[10] = camera, alert
+    assert not _pv5_section_step(state, cp, alt, 1 + i / 10, bytes(status)).vehicleNaviSectionActive
+
+
+def test_pv5_section_imperial_limit_remains_stable():
+  state, cp, alt = _pv5_section_state()
+  state.is_metric = False
+  _pv5_section_step(state, cp, alt, 1)
+  ret = _pv5_section_step(state, cp, alt, 1.1, PV5_SECTION_HIGH)
+  assert ret.vehicleNaviSpeed == pytest.approx(80 * 1.609344)
+  assert _pv5_section_step(state, cp, alt, 1.2).vehicleNaviSectionActive
 
 
 def test_vehicle_navi_stale_range_average_releases_section():

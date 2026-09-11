@@ -5,7 +5,7 @@
 > [!NOTE]
 > This is the canonical English user guide maintained with the `carrot-wip` code. When user-visible behavior changes, update this document together with the related code and tests.
 
-This page explains all **22 speed and deceleration settings** in the current code: event targets, deceleration distance, stock-navigation CAN, road-limit adjustment, speed bumps, curve/route/model speed, and traffic-light stop adjustment.
+This page explains all **23 speed and deceleration settings** in the current code: event targets, deceleration distance, stock-navigation CAN, road-limit adjustment, speed bumps, curve/route/model speed, and traffic-light stop adjustment.
 
 Change them in **Carrot Web → Settings → Driving control → Speed and deceleration**.
 
@@ -30,7 +30,6 @@ The code collects several candidates and selects their minimum as `desired_speed
 | Road limit plus offset | `AutoRoadSpeedLimitOffset` |
 | Vision curve | `AutoCurveSpeedFactor`, `TurnSpeedControlMode` |
 | Route turn | `MapTurnSpeedFactor`, `TurnSpeedControlMode` |
-| Future model speed | `ModelTurnSpeedFactor` |
 | Separate automatic turn control | `AutoTurnControl*` |
 
 If raising one value produces no change, another source may already be lower. Check the displayed source, event type, target limit, and remaining distance together.
@@ -68,7 +67,20 @@ The event type, limit, and distance must all be valid. An average-speed zone ret
 
 ### Stock-navigation CAN control
 
-`VehicleNaviCanControl` uses exact camera and speed-bump distances from the stock navigation on supported Hyundai/Kia CAN-FD vehicles. On the Kia PV5, it currently supports regular cameras and speed bumps only; average-speed zones and `VehicleNaviSchoolZoneControl` remain disabled until the required periodic zone-state signal is validated.
+`VehicleNaviCanControl` selects when exact camera and speed-bump distances from stock navigation are used on supported Hyundai/Kia CAN-FD vehicles. The previous enabled value, `1`, remains the always-apply mode.
+
+| Value | vNAVI future-event scope |
+|---:|---|
+| `0` | Disabled |
+| `1` | Always use cameras and bumps |
+| `2` | Always use cameras; use bumps only when they match the calculated route |
+| `3` | Use both cameras and bumps only when they match the calculated route |
+
+A route match requires vNAVI to mark the current segment as `calculated_route=1` and the future event's path index to equal the current path. With no route, during recalculation, on a path-index mismatch, or when route data is more than two seconds old, mode `2` rejects queued bumps and mode `3` rejects queued cameras and bumps. This filter applies only to future distance profiles. Current camera states confirmed directly by the vehicle remain controlled separately by `VehicleSpeedCameraControlMode`.
+
+The Kia PV5 also holds a section speed cap after a section alert. A currently active section confirmed directly by the PV5 remains effective in `VehicleNaviCanControl` modes `1`–`3`. It retains the cap after the brief alert ends and releases it when navigation enforcement ends, on early exit, on conflicting limits, or after more than one second of signal loss.
+
+PV5 section control does not calculate average speed or remaining distance. Restarting, losing signals, or re-enabling the setting requires a new section alert, so the cap may not resume immediately within a zone. Recorded driving validates entry, retention within the zone, and early exit; passage through the actual enforcement endpoint remains to be validated. `VehicleNaviSchoolZoneControl` remains unsupported on the PV5.
 
 This experimental control is off by default. First verify that the displayed event type, limit, and remaining distance match the road, and disable it immediately if they do not.
 
@@ -181,7 +193,7 @@ For `-1`, a non-negative offset selects limit + offset; a negative offset select
 <a id="speed-bump"></a>
 ## 3. Speed bumps
 
-Speed-bump control requires `AutoNaviSpeedCtrlMode >= 2`, a bump event and distance, and a road category that the code does not treat as highway.
+Speed-bump control uses `AutoNaviSpeedBumpTime`, `AutoNaviSpeedBumpSpeed`, and `AutoNaviSpeedBumpEndDistance`. It requires `AutoNaviSpeedCtrlMode >= 2`, a bump event and distance, and a road category that the code does not treat as highway. A stock-navigation CAN bump must also satisfy the route condition selected by `VehicleNaviCanControl`.
 
 ### `AutoNaviSpeedBumpSpeed`
 
@@ -193,29 +205,38 @@ This is the crossing target in km/h. Raise it to cross faster and lower it to cr
 
 At 36 km/h (10 m/s), 1 second aims to reach target about 10 m before the bump; 3 seconds aims for about 30 m. A larger value finishes earlier. The approach curve still uses `AutoNaviSpeedDecelRate`.
 
+### `AutoNaviSpeedBumpEndDistance`
+
+The speed-bump limit is released when remaining distance is at or below this setting. The stored and displayed unit is cm, so the default `200` releases the limit 2 m before the received bump position. `0` preserves the former behavior through the received point.
+
+This does not move the bump or change its approach curve. Normal longitudinal control restores speed after the bump limit is removed, and the countdown may continue to the received position. Raise the value in 10–50 cm steps when a mapped bump lies behind the physical bump and recovery starts late. Lower it if the vehicle begins accelerating before the actual bump.
+
 As with a camera event, a new accelerator press after a bump signal has begun actual deceleration is treated as a request to ignore that bump. The highest speed reached while accelerating becomes the floor for the rest of the event, and the floor is cleared when the bump event ends. An accelerator held from before deceleration began does not start the override.
 
-If there is no slowing, check mode 2+, event type 22, remaining distance, and road category. For late slowing, lower `DecelRate` or raise `BumpTime`; for an incorrect crossing speed, adjust only `BumpSpeed`.
+If there is no slowing, check mode 2+, event type 22, remaining distance, road category, and the stock-navigation route mode. For late slowing, lower `DecelRate` or raise `BumpTime`; for an incorrect crossing speed, adjust only `BumpSpeed`. If recovery starts late after passing the bump, raise `BumpEndDistance`; if it starts before the bump, lower it.
 
 <a id="curve-turn"></a>
 ## 4. Curves and turns
 
-There are four distinct sources:
+There are three distinct sources:
 
 - **Vision curve speed** from predicted yaw rate and speed
 - **Route-turn speed** from route/turn input
-- **Future model speed** at a selected future time
 - **Applied model driving speed** from the model's overall desired velocity
 
 ### `AutoCurveSpeedFactor`
 
-The code scales model yaw rate and calculates a curve speed around a 1.9 m/s² lateral-acceleration target. A larger factor treats the same curve as sharper and produces a lower target.
+The code divides predicted yaw rate by velocity at the same point to obtain curvature. It divides the 1.9 m/s² reference lateral-acceleration budget by the setting ratio, so a higher factor produces a lower curve target. Predicted future velocity is not used directly as a driving-speed target.
+
+The curve target and remaining path distance determine the speed ceiling at the current position. A distant curve permits a higher approach speed; the ceiling decreases toward the curve target as the vehicle approaches. The calculation reserves time for control response and gradual braking buildup. Release briefly holds the limit and then raises it progressively.
+
+Slow or invalid model predictions and isolated yaw-rate spikes are excluded. Late or inaccurate curve predictions can still lead to late deceleration.
 
 The relationship is approximately inverse-square-root: changing 100% to 120% produces about `1 / √1.2`, or 91% of the previous calculated speed. Raise it one step if curves are too fast; lower it if they are too slow.
 
 ### `AutoCurveSpeedLowerLimit`
 
-This floor applies to vision-curve, route-turn, and future-model candidates. Raising it prevents those sources from selecting a lower speed, which can leave insufficient slowing for a sharp curve. It is not an automatically safe minimum.
+This floor applies to vision-curve and route-turn candidates. For vision curves, it applies to the curve target before remaining distance determines the current approach ceiling. Raising it prevents those sources from selecting a lower speed, which can leave insufficient slowing for a sharp curve. It is not an automatically safe minimum.
 
 ### `TurnSpeedControlMode`
 
@@ -229,26 +250,13 @@ This floor applies to vision-curve, route-turn, and future-model candidates. Rai
 In mode 2, route-turn speed enters only when turn distance is roughly between -500 m and +500 m. Mode 3 can cause unexpected slowing when route data is inaccurate.
 
 > [!IMPORTANT]
-> Mode `0` does not disable every model-derived speed function. Check `ModelTurnSpeedFactor` and `ApplyModelSpeed` separately.
+> Mode `0` does not disable every model-derived speed function. `ApplyModelSpeed` changes cruise set speed separately.
 
 ### `MapTurnSpeedFactor`
 
     route-turn candidate = route speed × factor / 100
 
 80% lowers the received value; 100% keeps it; 120% raises it. `AutoCurveSpeedLowerLimit` is then applied as the floor. Valid supported route-speed input is required.
-
-### `ModelTurnSpeedFactor`
-
-The stored value is multiplied by `0.1 seconds` to choose a future point in the model prediction:
-
-| Value | Future point |
-|---:|---:|
-| `0` | Disabled; candidate set to 200 km/h |
-| `10` | About 1.0 s ahead |
-| `30` | About 3.0 s ahead |
-| `50` | About 5.0 s ahead |
-
-The chosen speed is multiplied by 1.2 and smoothed. A larger setting does not necessarily mean slower; it depends on the predicted speed at that future point.
 
 ### `ApplyModelSpeed`
 
@@ -266,7 +274,7 @@ This is not curve-only. It applies the driving model's `desiredVelocity` to crui
 > [!WARNING]
 > A negative value is a strong continuous overwrite, not a “deceleration only” switch. Without a valid road limit, the ceiling can become zero. Leave it at `0` unless you fully understand the input path and behavior.
 
-For isolated tuning, start with mode 1, `ModelTurnSpeedFactor=0`, and `ApplyModelSpeed=0`; adjust the curve factor, then the floor, then add route and future-model sources one at a time.
+For isolated tuning, start with mode 1 and `ApplyModelSpeed=0`; adjust the curve factor, then the floor, and then check route-turn control. Test `ApplyModelSpeed` separately because it changes cruise set speed.
 
 <a id="traffic-light"></a>
 ## 5. Traffic-light detection

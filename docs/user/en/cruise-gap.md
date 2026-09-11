@@ -34,7 +34,7 @@ Change them in **Carrot Web → Settings → Driving control → Cruise and foll
 
 The same symptom can therefore have different causes. A slow launch might come from the low-speed acceleration table, start acceleration-change cost, PID gains, or a vehicle limit.
 
-Catalog defaults and initial Params values currently differ for `CruiseMaxVals1` through `6`, `StopDistanceCarrot`, and `DynamicTFollowLC`. Use the value shown on your device as the baseline.
+Catalog defaults and initial Params values currently differ for `CruiseMaxVals1` through `6` and `StopDistanceCarrot`. Use the value shown on your device as the baseline.
 
 <a id="driving-mode"></a>
 ## 1. Driving mode
@@ -43,26 +43,28 @@ Catalog defaults and initial Params values currently differ for `CruiseMaxVals1`
 
 | Value | Mode | Max acceleration | `comfort_brake` | Time-gap term | Additional behavior |
 |---:|---|---:|---:|---:|---|
-| `1` | Eco | ×0.9 | ×0.9 | ×0.9, then clamped | Traffic-light detection retained |
-| `2` | Safe | ×0.8 | ×0.8 | ×0.8, then clamped | Congestion state used by auto mode |
+| `1` | Eco | ×0.9 | ×1.0 | ×1.1, then clamped | Traffic-light detection retained |
+| `2` | Safe | ×0.8 | ×0.9 | ×1.2, then clamped | Congestion state used by auto mode |
 | `3` | Normal | ×1.0 | ×1.0 | ×1.0 | Baseline |
 | `4` | High speed | ×1.2 | ×1.0 | ×1.0 | Traffic stop/go detection forced off |
 
-A smaller `comfort_brake` increases the distance term calculated for stopping, while `t_follow` is reduced by 10% in Eco and 20% in Safe mode. “Safe” therefore does not simply mean a longer time gap; final distance depends on ego and lead speeds.
+A smaller `comfort_brake` increases the stopping-distance term. Baseline time-gap factors are 1.1 in Eco and 1.2 in Safe; speed scaling, clamps, deceleration allowance and selected-TF priority at levels 4–5 determine the final gap.
 
 > [!WARNING]
 > High-speed mode raises the acceleration ceiling by 20% and ignores traffic-light control.
 
+In Safe mode, levels 4–5 retain existing launch response and boost entry. Only when ego out-accelerates the lead while catching the target gap does the future positive-acceleration ceiling taper. Renewed lead acceleration or sufficient opening gap removes the extra restriction. This Safe acceleration limiter itself adds no gap allowance; existing Safe acceleration limits, TF processing and braking limits remain active.
+
 ### `MyDrivingModeAuto`
 
-`0` uses the stored mode. `1` switches only between Safe and Normal according to traffic conditions; it never automatically selects Eco or High-speed mode.
+`0` uses the stored mode. `1` switches only between Safe and Normal according to traffic conditions; `2` switches between Safe and Eco. High-speed mode is never selected automatically.
 
 The current code enters congestion after repeated observations of either:
 
 - Lead distance at most 12 m and lead speed at most 2 km/h; or
 - Lead speed below 5 km/h, lead acceleration below 0.2 m/s², ego speed above 1 km/h, and lead distance below 200 m.
 
-It exits when lead acceleration exceeds 1.5 m/s², ego speed exceeds 35 km/h, or no lead is present within 200 m. The running code uses **35 km/h**, despite the setting description saying 20 km/h.
+It exits when lead acceleration exceeds 1.5 m/s², ego speed exceeds 35 km/h, or no lead is present within 200 m. The speed-based congestion exit threshold is **35 km/h**.
 
 Changing the stored `MyDrivingMode` during a drive can suspend automatic switching until the planner process restarts. For a stable comparison, use `MyDrivingMode=3` and `MyDrivingModeAuto=0`.
 
@@ -170,13 +172,11 @@ Hyundai/Kia configurations can expose all four personalities. Other vehicles can
 
 ### Actual application order
 
-1. Select a base gap from the personality or speed table.
-2. Apply the positive `EnableSpeedTF` low-speed reduction.
-3. During deceleration, suspend that reduction and add `TFollowDecelBoost`.
-4. Apply Eco/Safe driving-mode factors.
-5. Clamp to the minimum and maximum of the four base values.
-6. Apply `DynamicTFollowLC` during a lane change; otherwise apply `DynamicTFollow` when a lead exists.
-7. Rate-limit increases so the gap does not jump suddenly.
+1. Select baseline TF from personality or the speed table.
+2. Apply speed reduction and driving-mode factors, subject to the level 4–5 accelerating-lead exception below.
+3. Hold baseline TF against reduction during braking, then add `TFollowDecelBoost` once.
+4. Apply configured/global bounds and rate-limit TF increases.
+5. Release extra deceleration margin at 0.10 seconds per second as braking eases.
 
 ### `EnableSpeedTF`
 
@@ -192,89 +192,98 @@ For a positive value of 20, the time gap is 80% of base at 0 km/h, 90% at 50 km/
 
 Negative modes build a speed table and then apply personality multipliers of ×1.0, ×1.3, ×1.6, and ×2.0. The result is clamped back to the four values' minimum/maximum, so large multipliers may stop near `TFollowGap4`.
 
-Tracking a lead with `LeadAccelResponse=4` or `5` is an exception at every following-distance level. The selected gap’s `TFollowGap1`–`TFollowGap4` setting takes priority over positive or negative `EnableSpeedTF` adjustments and Eco/Safe gap factors only while a stable radar lead is accelerating positively and the gap is opening. When lead acceleration falls to `0.1 m/s²` or below, the exception is removed immediately and normal gap control—including the existing TF increase ramp—and braking behavior resume. It does not change the no-lead cruise target; `TFollowDecelBoost`, lane-change, and `DynamicTFollow` adjustments can still apply.
-
-### `DynamicTFollow`
-
-Range 0–100, step 1; zero disables it. It changes time gap from lead jerk `jLead`:
-
-- Rapid change toward lead deceleration increases the gap.
-- Rapid change toward lead acceleration decreases the gap.
-- Around `jLead=-0.5` to `+0.5`, there is little adjustment.
-
-A value of 50 permits up to about ±0.50 s under a strong change; 100 permits about ±1.00 s. The result is clamped to 0.3–2.0 s, and increases are smoothed.
+Tracking a lead with `LeadAccelResponse=4` or `5` is an exception at every following-distance level. The selected gap’s `TFollowGap1`–`TFollowGap4` setting takes priority over positive or negative `EnableSpeedTF` adjustments and Eco/Safe gap factors only while a stable radar lead is accelerating positively and the gap is opening. When lead acceleration falls to `0.1 m/s²` or below, the exception is removed immediately and normal gap control—including the existing TF increase ramp—and braking behavior resume. It does not change the no-lead cruise target. During lane-change starting and finishing, this exception and stronger acceleration response are disabled, retaining normal base TF.
 
 ### `DynamicTFollowLC`
 
-For about 1.5 seconds after lane-change start, this percentage multiplies the time gap. Range 20–100, step 5: 100 retains the gap; 80 uses 80%; 20 is the code's minimum ratio.
+This setting permits bounded relief of the old lead's following-distance requirement after predicted body clearance. It does not reduce the common TF or acceleration-change costs during a lane change. Range 20–100, step 5.
 
-The catalog default is currently 0 even though the range is 20–100 and initial Params value is 100. If zero reaches the running code, it is forced to 20%.
+- `100`: no additional relief for the old lead.
+- Lower values: more relief after confirmed departure.
+- `80` and below: the same cap. Legacy values such as `50` or `20` no longer substantially shorten TF.
 
-> [!WARNING]
-> This multiplier is applied after the base time gap has been clamped to at least 0.3 s, and there is no second 0.3-second clamp. Applying 20% to 1.10 s can therefore produce about 0.22 s. Low values are very aggressive.
+The catalog and initial Params default are both `100`. Invalid values, including `0`, disable additional relief. Establish baseline behavior at `100` and change one step at a time. Lower values do not mean faster acceleration in every lane change.
+
+Relief requires measured lateral movement, continuous observations of the same lead, predicted body clearance, and sufficient selected leadTwo spacing. It starts only after predicted clearance plus 0.35 seconds. The cap is the smallest of 20% of base TF, 0.25 seconds, and 4 metres. Current leadOne/leadTwo retain normal TF.
+
+A blind-spot warning, cancellation, changed or missing tracks, missing pose data, or a missing normally selected second lead blocks additional relief. A lane that appears empty does not authorize earlier acceleration without sufficient observations. This setting does not replace lane-change permission checks or checking rear traffic.
+
+
+The normally selected leadOne/leadTwo at lane-change entry form the reference pair. If either selected lead changes or disappears, additional acceleration relief stops for the rest of that maneuver. Braking uses only the currently selected leads; side radar candidates and stored entry vehicles never become additional braking obstacles.
 
 ### `TFollowDecelBoost`
+
+The margin is added once to baseline TF and does not accumulate during sustained deceleration. As braking eases, or the setting is changed to zero, applied extra margin releases at 0.10 seconds per second. Increasing braking margin is not delayed by this release rate.
+
+The default is `0%`, which adds no extra time gap based on deceleration strength. Existing saved vehicle settings are preserved after an update.
 
 At ego acceleration around -0.2 m/s² or below, the code first prevents speed adjustment from reducing the target gap. This prevention works even when the setting is zero. The setting then adds gap based on deceleration strength.
 
 At `TFollowDecelBoost=50`, the addition is approximately 0.03 s at -0.3 m/s², 0.125 s at -1.0 m/s², and a maximum around 0.25 s at -2.5 m/s². Range is 0–100 in steps of 10.
 
-For a clean baseline, use `EnableSpeedTF=0`, `DynamicTFollow=0`, `DynamicTFollowLC=100`, `MyDrivingMode=3`, and `MyDrivingModeAuto=0`. If the result is still wrong, check the base gaps, stop distance, selected personality, and radar lead before adding dynamic features.
+For a clean baseline, use `EnableSpeedTF=0`, `DynamicTFollowLC=100`, `MyDrivingMode=3`, and `MyDrivingModeAuto=0`. If the result is still wrong, check the base gaps, stop distance, selected personality, and radar lead before adding dynamic features.
 
 <a id="lead-response"></a>
 ## 6. Lead-vehicle response
 
-| Setting | Range/scale | Role |
-|---|---|---|
-| `LeadAccelResponse` | 0–5, default 0 | Driver response preference for a lead starting or accelerating at every following-distance level |
-| `RadarReactionFactor` | 0–200%, default 100% | How long measured lead acceleration persists into the future |
-| `JLeadFactor3` | 0–100, ×0.01 | How much lead acceleration change enters future trajectory prediction |
+Use `LeadAccelResponse` to adjust response to a lead starting, accelerating or being approached. Its range is 0–5; the default 0 disables acceleration boost and recovers extra TF most slowly.
 
 ### `LeadAccelResponse`
 
-When the lead starts or accelerates and the gap begins to open, this setting reduces MPC's acceleration-change and jerk costs by level so it can select a faster new acceleration trajectory. It operates at **all following-distance levels 1–4**; response strength and following distance are independent selections. It follows the TF for the selected gap; response levels 4–5 prioritize `TFollowGap3` when following-distance level 3 is selected. Levels 3–5 also operate when a stable radar lead remains but the current MPC source changes to `cruise`.
+Sets lead-start and acceleration response at every following-distance level. Levels 1–3 soften small changes and response near the target gap; level 4 is quick and level 5 retains the immediate maximum response. The selected TF remains the reference; a separate lead-jerk adjustment no longer expands or shrinks TF.
 
-| Value | UI meaning | Active `aChangeCost` | Additional multiplier on existing jerk cost | Strong response ends |
-|---:|---|---:|---:|---:|
-| `0` | Disabled | `200` | `100%` | Not applicable |
-| `1` | Weak | `170` | `95%` | Configured TF reached |
-| `2` | Mild | `130` | `80%` | Configured TF reached |
-| `3` | Brisk (recommended) | `80` | `60%` | Configured TF reached |
-| `4` | Urgent follow | `36` | `35%` | Configured TF reached |
-| `5` | Maximum follow (test) | `10` | `15%` | Configured TF reached |
+| Level | `aChangeCost` at full boost | Multiplier on existing jerk cost |
+|---|---:|---:|
+| 0 Relaxed recovery | 200 | 100% |
+| 1 Most gradual | 190 | 95% |
+| 2 Gentle follow | 170 | 85% |
+| 3 Balanced follow | 130 | 70% |
+| 4 Urgent follow | 36 | 35% |
+| 5 Maximum follow (test) | 10 | 15% |
 
-Lower `aChangeCost` releases the solution from the previous MPC acceleration plan, while lower jerk cost permits a steeper transition to the new acceleration. Level 3 is the brisk everyday choice, level 4 is for an urgent driver, and level 5 is the maximum test level intended to feel distinctly strong. These values reduce the active-driving base cost of `200`; they do not change `AChangeCostStarting` or velocity-PID gains.
+With sufficient input, levels 1–4 ramp boost entry over 0.80/0.60/0.40/0.15 seconds. Boost scales down when distance margin is below 2.0/1.5/1.0/0.5 metres respectively, or the acceleration signal is small. The table gives full-boost costs; small changes stay closer to baseline costs. Level 5 has neither fade nor entry delay. Vehicles previously using DynamicTFollow may feel different because its additional TF reduction and jerk boost are removed.
 
-No positive acceleration is added after MPC. `vTargetNow` and `aTarget` therefore come from the same MPC velocity and acceleration trajectory. `CruiseMaxVals` remains MPC's hard acceleration ceiling, while curve, cut-in pre-deceleration, lead-obstacle, and danger-distance limits remain intact.
+Acceleration boost at every level requires normal ACC, no accelerator override or stop request, and a stable radar lead. Levels 1–2 use lead0/lead1 sources; levels 3–5 also support cruise. Cruise requires more than 1 km/h of set-speed headroom. Lead acceleration must exceed 0.1 m/s²; levels 1–4 with a lead source also require relative acceleration above the 0.1 m/s² deadband. Existing relative-speed and level-specific prediction gates remain active.
 
-A nonzero value responds only when all of these common gates pass:
+Boost ends immediately at the TF target distance, when lead acceleration ends, or when closing-speed conditions fail. A changed lead restarts gradual entry at levels 1–4. Level 5 retains the −0.2 m/s relative-speed floor and 0.5-second prediction condition. All levels disable boost during lane-change starting/finishing, blended mode, and vision-only lead tracking.
 
-- The normal ACC planner is active, no stop is requested, and the driver is not pressing the accelerator.
-- The same radar track has been observed for at least three consecutive updates. Levels 1–2 require a radar-lead MPC source; levels 3–5 may also operate with a `cruise` source.
-- Every level requires measured lead acceleration above `0.1 m/s²`. With a radar-lead source, levels 1–4 additionally require relative lead acceleration above the `0.1 m/s²` deadband.
-- Current relative speed plus predicted lead acceleration shows the lead pulling away while respecting the level-specific relative-speed floor.
-- With a `cruise` source, set speed exceeds current speed by more than `1 km/h`.
+Levels 4–5 prioritize the selected `TFollowGap1`–`TFollowGap4` while a stable lead accelerates and the gap opens. Levels 1–3 retain normal speed/mode TF processing. `CruiseMaxVals`, curve, cut-in, lead-distance and danger-distance limits, and deceleration preview remain active. No acceleration is added after MPC. This setting does not change `AChangeCostStarting` or PID gains. Lower levels do not delay braking required by an urgent approach.
 
-Every level uses the strong cost reduction only while actual distance exceeds the configured TF target. At or inside that target, the reduction is removed immediately, the default `aChangeCost=200` and normal jerk cost return, and ordinary MPC safely maintains the gap. Level 5 still requires relative speed of at least `-0.2 m/s` and a gap predicted to open within 0.5 seconds. If the lead reaches zero acceleration or begins decelerating, the existing MPC lead prediction and deceleration preview continue unchanged.
+Deceleration preview operates independently of the response level. During active control, remaining correction releases progressively when relative acceleration eases or the lead switches between radar and vision or disappears. Accelerator or brake intervention and longitudinal control exit clear it immediately. Crossing zero relative acceleration does not remove the correction in one step. New hard-deceleration requests retain the existing preview attack rate and braking bounds.
 
-Levels 1–3 do not change the target time gap. The level 4–5 exception that prioritizes the selected gap’s configured `TFollowGap1`–`TFollowGap4` as the base target applies only during positive lead acceleration; `DynamicTFollow` and lane-change corrections may still apply afterward. Lead-braking response and stopping behavior retain normal control at every level. Every level remains inactive with the experimental blended planner or a vision-only lead. Use level 5 only when you can verify that short-gap starts do not cause unwanted acceleration.
+Levels 0–4 capture half of the excess over the base following distance when acquiring a radar lead or while the measured following gap opens. Base TF plus extra TF is capped at 2.5 seconds without reducing a larger base TF. A first-order filter recovers the extra TF even while the gap opens, most slowly at level 0. A large gap alone does not repeatedly refill it. A stopped lead retains it; a slow lead recovers it more slowly. Level 5 adds no extra TF. This replaces the previous relative-closing-speed distance allowance rather than stacking with it.
 
-### `RadarReactionFactor`
+Headroom applies to a stable radar lead in normal ACC. Accelerator override, disengagement, forced deceleration and lane changes disable it. Unlike acceleration boost, it also applies at level 0 and during stopping. Target loss/replacement or a level change does not transfer the old allowance.
 
-Radar acceleration and jerk form `aLeadTau`, used by MPC to predict how long the lead's current acceleration or deceleration will continue.
+Acquisition allowance ramps in over 0.8 seconds. Afterward, a larger candidate is accepted when measured relative speed, filtered with a 0.3-second time constant, exceeds 0.2m/s; further increases are limited to 0.5 TF seconds per second. A brief lead-acceleration lull does not end capture while the gap keeps opening, and renewed opening can capture more headroom.
 
-- Lower values assume the measured change persists longer and respond more quickly.
-- Higher values let it decay sooner and may respond more smoothly but later.
-- Too low can react to radar noise; too high can respond slowly to real lead braking.
+Stored extra TF continues recovering during capture. A constant or closing gap does not refill it. A newly acquired slower or stopped lead can receive initial headroom without an opening gap. The stopped-lead hold rule is described below.
 
-### `JLeadFactor3`
+| Level | Base recovery time constant | Extra TF |
+|---|---:|---|
+| 0 | 5 seconds | Active |
+| 1 | 4 seconds | Active |
+| 2 | 3 seconds | Active |
+| 3 | 2 seconds | Active |
+| 4 | 1 second | Active |
+| 5 | — | None |
 
-The code smooths `jLead` as 10% new and 90% previous, multiplies by this percentage, clamps to -1 through +1, and inserts it into the future lead trajectory. Zero excludes jerk; 50 uses half; 100 uses the full allowed value.
+Lead speed at or below 0.3m/s holds extra TF. From 0.3 to 5m/s, recovery strength increases linearly with lead speed; at 5m/s and above the table applies. A five-second time constant leaves roughly 37% after five seconds rather than completing recovery. For a stopped lead, the extra-TF distance term shrinks with ego speed toward normal stopping clearance.
 
-> [!NOTE]
-> Even with `JLeadFactor3=0`, `DynamicTFollow` separately uses raw `jLead`. Check both settings when isolating jerk-related behavior.
+Capture uses actual distance minus the base target distance, with a 1m/s minimum divisor at low ego speed. Without excess over the base target including braking-distance terms, there is no new extra TF. Only the MPC comfort reference changes; physical lead positions, base TF, danger constraints and braking limits stay unchanged. Temporary TF does not guarantee a particular braking onset or ride quality. Ego-deceleration `TFollowDecelBoost` remains separate existing TF processing.
 
-For a baseline, set `DynamicTFollow=0`, `LeadAccelResponse=0`, `JLeadFactor3=0`, and `RadarReactionFactor=100`. If response to a lead starting or accelerating is late at your selected gap, raise `LeadAccelResponse` from level 1 one step at a time. Change only one setting at once, and restore immediately if surging or unintended acceleration appears.
+In Safe mode, levels 4–5 retain existing launch response and boost entry. Only when ego out-accelerates the lead while catching the target gap does the future positive-acceleration ceiling taper. Renewed lead acceleration or sufficient opening gap removes the extra restriction. This Safe acceleration limiter itself adds no gap allowance; existing Safe acceleration limits, TF processing and braking limits remain active.
+
+Current target-distance headroom, relative speed and lead acceleration estimate the approach over about two seconds. Settling is considered only when ego acceleration exceeds the lead’s positive acceleration by more than 0.1 m/s². The future ceiling descends from current acceleration at 0.8 m/s² per second of prediction time; this is not a fixed vehicle jerk limit and never blocks negative acceleration.
+
+Safe entry and exit blend the correction over 0.8 seconds. Target change/loss and existing boost inhibits such as accelerator override or lane change clear the state. Steady operation in Normal and levels 0–3 receive no settling correction. Configured TF is not increased, and existing selected-TF priority conditions for levels 4–5 during lead acceleration remain. Prompt launches still respect the existing Safe acceleration ceiling and do not guarantee prevention of cut-ins.
+
+### Adjustment sequence
+
+1. Keep driving mode and time gap fixed, and use `LeadAccelResponse=0` to check gradual gap recovery without acceleration boost.
+2. Adjust `LeadAccelResponse` one level at a time to change response to a lead starting or accelerating at the selected gap.
+3. Compare launch response, acceleration settling during approach and deceleration in the same driving mode at similar speeds and lead conditions.
+4. Restore the previous value if surging or unintended acceleration appears.
 
 <a id="carrot-cruise"></a>
 ## 7. Carrot cruise
@@ -344,3 +353,9 @@ Related: [Understanding Settings](settings.md) · [Tuning introduction](https://
 - `openpilot/selfdrive/controls/lib/longcontrol.py`
 - `openpilot/selfdrive/controls/radard.py`
 - `opendbc_repo/opendbc/car/hyundai/carcontroller.py`
+
+### Predicted departure of the lead vehicle
+
+When a previously confirmed moving front vehicle is leaving your path and vision has switched to a farther vehicle, ACC can gradually reduce the following-distance demand for the future period after its predicted departure. The radar track and its measured distance and speed remain available.
+
+The adjustment requires continuous measured outward motion and sufficient separation until the vehicle body clears the path. It affects only predictions after clearance plus 0.30 seconds, and is limited to half the selected time gap, at most 0.50 seconds or 8 m. Closer leadTwo vehicles, traffic stops, cruise limits, and the original collision-warning trajectory remain in the calculation. Loss of evidence cancels the adjustment; it does not operate during pedal override, in blended mode, or for stationary or strongly braking leads. See [radar behavior](radar.md).
