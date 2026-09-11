@@ -376,14 +376,19 @@ ratio and is taller than before while the gap bars keep their own size/spacing;
 all four gap bars stay visible, sit close together, and bottom-align to the
 vehicle while inactive bars are gray and active bars use `#bb3d91`. Cruise set
 speed and `km/h` use the same font size and color; paused cruise keeps the set
-speed but draws it gray, and inactive cruise draws gray `--- km/h`. The orange
+speed but draws it gray, and inactive cruise draws gray `--- km/h`. The
 deceleration override keeps the selected `carrotMan.desiredSource` control
-value unchanged but annotates its displayed origin: navigation camera `cam:n`,
-vehicle/HDA camera `cam:v`, vehicle-side route curvature `route:v`, and
-comma-model turn prediction `turn:c`. Navigation TBT turn control displays
-`turn:n`; the label font scales down slightly for longer values such as
-`section:n` instead of dropping the origin suffix. The separate lane-change
-icon is not drawn. The LFA icon uses
+value unchanged. External navigation sources (`cam`, `section`, `bump`,
+`police`, `waze`, `road`, `atc`, `atc2`, and `route`) display their actual reason in orange.
+Vehicle
+CAN navigation sources (`hda`, `hda_bump`, and `school`) display their actual reason in
+lavender. Other sources retain concise labels: navigation TBT is `turn`, the
+lane/curvature candidate is `vturn`, model prediction is `model`, and gas
+override is `gas` in orange. Vehicle navigation availability does
+not force an auxiliary speed while cruise is off. The separate lane-change icon is
+not drawn. A vehicle-CAN source does not count as an external navigation
+session, so it does not replace the default driving-report panel; actual 7713/7714
+guidance still replaces that panel normally. The LFA icon uses
 `selfdrive/assets/icons_mici/carrot_wheel_org.png`, rotates by
 `-carState.steeringAngleDeg`, and recolors its white pixels green when LFA is
 active. When `controlsState.activeLaneLine` is true, the fixed
@@ -410,9 +415,14 @@ into one GPU texture at renderer startup, then each unchanged-size live pressure
 value is drawn inside its corresponding enlarged tire. It remains hidden only
 when all four pressure values are unavailable; individual missing values show
 `--`, and values below 31 psi are red. The surrounding area stays transparent. When
-external navigation is active or its dashboard is connected, the green `NAV`
-status appears below the Wi-Fi icon instead of the former lower-right `NAVI`
-label. The center clock, EV indicator, and fuel/DEF gauges are unchanged.
+legacy external navigation has a recent remote sender, or an alive and valid
+Carrot Navi v2 service reports `connected`, the orange `NAVI` status appears one
+character-width left of the Wi-Fi center. It takes priority over vehicle
+navigation availability. Once Hyundai CAN-FD `0x4BE` has been observed during
+the drive, lavender `vNAVI` appears in the same status slot instead. This
+availability status never follows `activeCarrot`, because vehicle-CAN speed
+candidates also change that control state. The center clock, EV indicator, and
+fuel/DEF gauges are unchanged.
 When `--fps` is omitted, `ClusterHudLiveFps` controls the render limit and is
 polled about once per second while running: `0` uncapped diagnostic mode, `1`
 10 Hz default, `2` 20 Hz, `3` 30 Hz, `4` 40 Hz, `5` 50 Hz, and `6` 60 Hz.
@@ -459,20 +469,29 @@ Mode `0` is the default mode that switches between navigation and the driving
 report. While onroad, shifting into park (`P`) temporarily gives the completed
 driving report priority over active navigation; leaving park restores navigation
 immediately. Explicit modes such as report mode `5` and navigation mode `6`
-remain fixed. Mode `1` shows the live debug panel with grouped `LIVE DELAY`, `LIVE TORQUE`,
-`STEERING`, and `LATERAL PLAN` rows, `2` is the system-debug slot rendering commit
-`c0a6773f794a5e4e86aeca8e14515232abc26b1b`'s mode-0 default system screen,
-`3` shows a large debug graph selected by `ShowPlotMode` with the driving scene
+remain fixed. Mode `1` fills the 792-pixel information region with 2-by-2
+`LIVE DELAY`, `LIVE TORQUE`, `STEERING`, and `LATERAL PLAN` cards. In 3D
+views it uses mode `0`'s 1124-pixel driving region and keeps the side gauges
+and TPMS inside that region. Mode `2` keeps a fixed two-card system
+dashboard regardless of connected, live, disconnected, or debug navigation
+state. The detail card shows network, display/frame rate, camera, memory-capacity,
+and per-core CPU state. The system-health card reuses commit `78aee2b3e`'s 2-by-2
+CPU/temperature/memory/disk gauges and pitch/yaw target; Navi state never replaces
+it with another information panel. In either 3D camera view, mode `2` uses the
+same 1124-pixel driving region and 792-pixel information region as mode `0`.
+Mode `3` shows a large debug graph selected by `ShowPlotMode` with the driving scene
 disabled, and `4` shows the same graph in the information panel while keeping
-the driving scene. Mode `4` keeps the acceleration, steering, fuel, and DEF
-gauges immediately to the left of the graph instead of near the center of the
-driving view; the gauge block follows the graph when the panel layout is
-swapped, while TPMS remains with the driving view.
+the driving scene. Mode `4` also uses mode `0`'s 1124-pixel 3D driving region,
+expands the graph across the opposite 792-pixel information region, and keeps
+the acceleration, steering, fuel, and DEF gauges plus TPMS inside the driving
+region's right edge. Swapping the panel layout exchanges both regions as units.
 `5` shows the driving report in the information panel while keeping the driving scene. The
 report uses a large trip/event summary card and a separate system-load card
-with four 2-by-2 circular gauges. A lower target plots stored calibration pitch
-vertically and yaw horizontally around the calibrated center while retaining
-the numeric angles. In managed live input, trip statistics remain stopped until
+with four 2-by-2 circular gauges. Its panel/card fills, outlines, primary and
+secondary text, unavailable values, gauges, and pitch/yaw target follow the
+active Auto, Dark, or Light `ClusterHudTheme` palette. A lower target plots
+stored calibration pitch vertically and yaw horizontally around the calibrated
+center while retaining the numeric angles. In managed live input, trip statistics remain stopped until
 `deviceState.started` is true, reset and start on that transition, freeze
 immediately when it becomes false, and reset again at the next onroad start.
 Replay and direct parser inputs retain their existing accumulation behavior.
@@ -497,10 +516,12 @@ other presentation with
 `cluster_replay_usb.py ROUTE --trip-report --language en --imperial`.
 In default screen mode (`0`), the trip report is shown while no live navigation
 is being received and the navigation panel returns automatically when reception
-starts. System-debug mode (`2`) reproduces the reference commit's mode-0 system
-screen and does not use the current automatic report fallback. It keeps the
-navigation/disconnected-system panel whenever a navigation dashboard exists,
-and falls back to the route overlay only when no navigation panel source exists.
+starts. System-debug mode (`2`) always keeps its detail and system-health cards.
+It does not switch to live navigation, Navi debug, `NAVI DISCONNECTED`, the route
+overlay, or the driving report when navigation state changes. In 3D views,
+modes `1`, `2`, and `4` reserve the same normal driving region as mode `0`; their
+right-side gauges and TPMS remain within that region rather than floating into
+the information panel.
 Fullscreen-3D mode (`-1`) never reserves a navigation/report panel in either 3D
 camera view, even when Navi data is available. Switching to road-camera view
 re-enables the complete mode-0 panel selection and panel-layout behavior.
@@ -546,7 +567,12 @@ vehicle length behind the raw `0m` reference so its front bumper aligns to that
 reference. The temporary radar-zero, lane-start, and ego-zero debug marker bars
 are no longer rendered.
 `ClusterHudCameraViewMode=0` keeps this current camera. Mode `1` uses a
-pulled-back ego-bottom camera view for cars without rear radar.
+pulled-back ego-bottom camera view for cars without rear radar. Mode `2` uses
+the normal road camera, mode `3` uses the wide road camera, and mode `4`
+automatically enters wide below `36 km/h` and returns to the normal camera at
+`54 km/h`. The hysteresis band retains the active stream. Wide-camera zoom
+increases smoothly with speed, and the camera image plus projected lane/radar
+overlay share the wide-camera calibration transform.
 The console refresh line prints `cam=<mode>` so live param changes can be
 confirmed while the HUD is running.
 When both raw camera-bus ADRV `0x1EA` and CCNC `0x162` corner messages are

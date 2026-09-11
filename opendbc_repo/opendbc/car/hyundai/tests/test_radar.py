@@ -8,15 +8,92 @@ import opendbc.car.hyundai.hyundaicanfd as hyundaicanfd
 import opendbc.car.hyundai.radar_interface as radar_interface_module
 from opendbc.car.hyundai.radar_interface import (
   CORNER_OBJECT_STABLE_TRACK_ID_START,
+  RADAR_MSG_COUNT,
   RADAR_MSG_COUNT3,
   RADAR_MSG_COUNT4,
+  RADAR_REQUIRED_MSG_COUNT,
   RADAR_START_ADDR_CANFD3,
   CornerObjectTrackIdManager,
   RadarInterface,
+  canfd_group2_track_status,
   corner_object_position_valid,
   deduplicate_corner_candidates,
 )
 from opendbc.car.hyundai.values import CAR, HyundaiExtFlags, HyundaiFlags
+
+
+class TestMandoRadar:
+  @staticmethod
+  def make_interface(monkeypatch):
+    class FakeParams:
+      def get_int(self, key):
+        return 1 if key == "EnableRadarTracks" else 0
+
+    monkeypatch.setattr(radar_interface_module, "Params", FakeParams)
+    cp = structs.CarParams()
+    cp.carFingerprint = CAR.HYUNDAI_GRANDEUR_IG
+    cp.flags = 0
+    cp.extFlags = 0
+    cp.radarUnavailable = False
+    cp.safetyConfigs = [structs.CarParams.SafetyConfig()]
+    return RadarInterface(cp)
+
+  def test_optional_upper_track_bank_and_32_slot_compatibility(self, monkeypatch):
+    radar_interface = self.make_interface(monkeypatch)
+
+    assert RADAR_MSG_COUNT == 64
+    assert RADAR_REQUIRED_MSG_COUNT == 32
+    assert radar_interface.radar_msg_count == 64
+    assert radar_interface.radar_required_msg_count == 32
+    assert radar_interface.trigger_msg_tracks == 0x51F
+    assert not radar_interface.rcp_tracks.message_states[0x51F].ignore_alive
+    assert radar_interface.rcp_tracks.message_states[0x520].ignore_alive
+    assert radar_interface.rcp_tracks.message_states[0x53F].ignore_alive
+
+    # This confirmed 0x52d target is the missing lead observed in a real
+    # 64-slot Grandeur IG log. The lower bank still provides the cycle trigger.
+    active_dat = bytes.fromhex("0060589b03fec0b2")
+    lower_bank = [(addr, bytes(8), 1) for addr in range(0x500, 0x520)]
+    radar_data = radar_interface.update([0, lower_bank + [(0x52D, active_dat, 1)]])
+    point = next(point for point in radar_data.points if point.trackId == 77)
+
+    assert not radar_data.errors.canError
+    assert point.measured
+    assert point.dRel == pytest.approx(math.cos(math.radians(2.2)) * 15.5)
+    assert point.yRel == pytest.approx(-0.5 * math.sin(math.radians(2.2)) * 15.5)
+    assert point.vRel == pytest.approx(1.78)
+    assert point.aRel == pytest.approx(-0.04)
+
+    # A 32-slot radar sends only the required lower bank. It must keep
+    # publishing without a CAN error, and the optional point must not go stale.
+    radar_data = radar_interface.update([0, lower_bank])
+    assert not radar_data.errors.canError
+    assert all(point.trackId != 77 for point in radar_data.points)
+
+
+class TestCanfdGroup2Radar:
+  @staticmethod
+  def parse(dat):
+    name = "RADAR_TRACK_3ac"
+    parser = CANParser("hyundai_canfd_radar_generated", [(name, 20)], 1)
+    parser.update([0, [(0x3AC, bytes.fromhex(dat), 1)]])
+    return parser.vl[name]
+
+  def test_tentative_overpass_reflection_is_not_confirmed(self):
+    track = self.parse("cb6706810c0f2069acf0ff5cbc0680330200003dd0020000")
+
+    assert track["VALID_CNT"] == 15
+    assert track["VALID"] == 1
+    assert track["LONG_DIST"] == pytest.approx(17.2)
+    assert canfd_group2_track_status(track) == (True, 1)
+
+  def test_confirmed_vehicle_remains_eligible(self):
+    track = self.parse("dbc1db5261ff308db8230030be0b400100000000d0020000")
+
+    assert track["VALID_CNT"] == 255
+    assert track["VALID"] == 2
+    assert track["LONG_DIST"] == pytest.approx(95.25)
+    assert canfd_group2_track_status(track) == (True, 2)
 
 
 class TestDensoRadar:
@@ -334,8 +411,10 @@ class TestCornerRadar430CandidateFilter:
       radar_data = radar_interface.update([0, packets])
     return radar_data
 
-  def test_430_promotes_supported_neighbor_bins(self, monkeypatch):
+  def test_430_bins_are_not_promoted_to_live_tracks(self, monkeypatch):
     radar_interface = self.build_interface(monkeypatch)
+    assert radar_interface.rcp_corner_objects_430 is None
+
     empty = self.message({})
     supported_bins = self.message({
       6: self.slot_word(1000),
@@ -345,13 +424,8 @@ class TestCornerRadar430CandidateFilter:
     packets += [(addr, empty, 1) for addr in range(0x440, 0x448)]
 
     radar_data = self.update_frames(radar_interface, packets)
-    points = {point.trackId: point for point in radar_data.points}
 
-    assert points[300].measured
-    assert str(points[300].radarSource) == "corner430"
-    assert points[300].dRel == pytest.approx(50.1)
-    assert points[300].yRel == pytest.approx(2.0)
-    assert points[300].yvRel == 0.0
+    assert all(str(point.radarSource) != "corner430" for point in radar_data.points)
 
   def test_430_expires_noncenter_inward_yvrel(self, monkeypatch):
     radar_interface = self.build_interface(monkeypatch)
@@ -378,6 +452,5 @@ class TestCornerRadar430CandidateFilter:
     radar_data = self.update_frames(radar_interface, packets, frames=3)
     points = {point.trackId: point for point in radar_data.points}
 
-    assert points[300].measured
-    assert points[300].yRel == pytest.approx(2.0)
-    assert points[300].yvRel == 0.0
+    assert 300 not in points
+    assert all(str(point.radarSource) != "corner430" for point in points.values())

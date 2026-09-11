@@ -7,7 +7,6 @@ from openpilot.common.params import Params
 from openpilot.system.hardware import PC, TICI
 from openpilot.system.manager.process import PythonProcess, NativeProcess, DaemonProcess
 
-FLASK_AVAILABLE = importlib.util.find_spec("flask") is not None
 try:
   BODYTELEOP_AVAILABLE = importlib.util.find_spec("openpilot.tools.bodyteleop.web") is not None
 except ModuleNotFoundError:
@@ -15,15 +14,6 @@ except ModuleNotFoundError:
 
 WEBCAM = os.getenv("USE_WEBCAM") is not None
 CARROT_WEB_EXTERNAL = os.getenv("CARROT_WEB_EXTERNAL") == "1"
-_carrot_radar_mode_for_drive = 0
-
-
-def _carrot_radar_mode(started: bool, params: Params) -> int:
-  """Refresh off-road, then latch one radar publisher for the whole drive."""
-  global _carrot_radar_mode_for_drive
-  if not started:
-    _carrot_radar_mode_for_drive = params.get_int("CarrotRadarMode")
-  return _carrot_radar_mode_for_drive
 
 def driverview(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started or params.get_bool("IsDriverViewEnabled")
@@ -72,35 +62,11 @@ def only_onroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started
 
 
-def conventional_radard(started: bool, params: Params, CP: car.CarParams) -> bool:
-  mode = _carrot_radar_mode(started, params)
-  return started and mode != 1
-
-
-def dpath_radard(started: bool, params: Params, CP: car.CarParams) -> bool:
-  mode = _carrot_radar_mode(started, params)
-  return started and mode == 1
-
-
 def only_offroad(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started
 
-# Wayon 원격 기능. /data/wayon_cloud/config.json 이 있을 때만 관련 프로세스가 뜬다.
-# 파일이 없으면 셋 다 기동하지 않으므로 설정 전에는 차량 동작에 아무 영향이 없다.
-WAYON_LIVE_ACTIVE_PATH = "/tmp/wayon_live.active"
-
-def wayon_remote_ready(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return os.path.isfile("/data/wayon_cloud/config.json")
-
-# 뷰어가 접속하면 wayon_live_stream 이 이 파일을 만든다 -> 오프로드에서도 카메라를 켠다.
-def wayon_live_streaming(started: bool, params: Params, CP: car.CarParams) -> bool:
-  return os.path.isfile(WAYON_LIVE_ACTIVE_PATH)
-
 def enable_updated(started: bool, params: Params, CP: car.CarParams) -> bool:
   return not started and params.get_bool("SoftwareMenu")
-
-def check_fleet(started, params, CP: car.CarParams) -> bool:
-  return FLASK_AVAILABLE
 
 def or_(*fns):
   return lambda *args: any(fn(*args) for fn in fns)
@@ -128,9 +94,6 @@ def enable_webrtc(started, params, CP: car.CarParams) -> bool:
   # WebRTC/encoder processes out of the same onroad session.
   return params.get_int("DisableDM") == 2 and not cluster_hud_active(params)
 
-def carrot_vision_active(started, params, CP: car.CarParams) -> bool:
-  return started and params.get_bool("CarrotVisionActive")
-
 def c3x_lite(started: bool, params: Params, CP: car.CarParams) -> bool:
   return started and params.get_bool("HardwareC3xLite")
 
@@ -154,7 +117,8 @@ def enable_youtube_encoder(started, params, CP: car.CarParams) -> bool:
 
 def enable_youtube_wide_encoder(started, params, CP: car.CarParams) -> bool:
   try:
-    return params.get_int("CarrotYouTubeLive") > 0 and params.get_int("CarrotYouTubeQuality") == 3
+    use_wide_camera = bool(params.get("UseWideCamera", return_default=True))
+    return use_wide_camera and params.get_int("CarrotYouTubeLive") > 0 and params.get_int("CarrotYouTubeQuality") == 3
   except Exception:
     return False
 
@@ -168,15 +132,17 @@ procs = [
   NativeProcess("encoderd", "openpilot/system/loggerd", ["./encoderd"], only_onroad),
   # Preserve generic multi-camera WebRTC for notCar users. Carrot Vision on a
   # real device is road-only and remains gated by DisableDM == 2.
-  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], or_(notcar, wayon_live_streaming)),
-  NativeProcess("carrot_vision_encoderd", "openpilot/system/loggerd", ["./encoderd", "--carrot-vision-road"], and_(iscar, enable_webrtc, carrot_vision_active)),
+  NativeProcess("stream_encoderd", "openpilot/system/loggerd", ["./encoderd", "--stream"], notcar),
+  # Prewarm the hardware encoder with the rest of the onroad stack. The
+  # encoder process stays idle until CarrotVisionActive is set by a session.
+  NativeProcess("carrot_vision_encoderd", "openpilot/system/loggerd", ["./encoderd", "--carrot-vision-road"], and_(iscar, enable_webrtc)),
   NativeProcess("youtube_low_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-low"], and_(only_onroad, enable_youtube_low_encoder)),
   NativeProcess("youtube_medium_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-medium"], and_(only_onroad, enable_youtube_medium_encoder)),
   NativeProcess("youtube_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube"], and_(only_onroad, enable_youtube_encoder)),
   NativeProcess("youtube_wide_encoderd", "openpilot/system/loggerd", ["./encoderd", "--youtube-wide"], and_(only_onroad, enable_youtube_wide_encoder)),
   PythonProcess("logmessaged", "openpilot.system.logmessaged", always_run),
 
-  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], or_(driverview, wayon_live_streaming), enabled=not WEBCAM),
+  NativeProcess("camerad", "openpilot/system/camerad", ["./camerad"], driverview, enabled=not WEBCAM),
   PythonProcess("webcamerad", "openpilot.tools.webcam.camerad", driverview, enabled=WEBCAM),
   PythonProcess("proclogd", "openpilot.system.proclogd", only_onroad, enabled=platform.system() != "Darwin"),
   PythonProcess("journald", "openpilot.system.journald", only_onroad, platform.system() != "Darwin"),
@@ -208,8 +174,7 @@ procs = [
   PythonProcess("plannerd", "openpilot.selfdrive.controls.plannerd", not_long_maneuver),
   PythonProcess("maneuversd", "openpilot.tools.longitudinal_maneuvers.maneuversd", long_maneuver),
   PythonProcess("lateral_maneuversd", "openpilot.tools.lateral_maneuvers.lateral_maneuversd", lat_maneuver),
-  PythonProcess("radard", "openpilot.selfdrive.controls.radard", conventional_radard),
-  PythonProcess("radard_dpath", "openpilot.selfdrive.carrot.radar.radard_dpath", dpath_radard),
+  PythonProcess("radard", "openpilot.selfdrive.carrot.radar.radard_dpath", only_onroad),
   PythonProcess("hardwared", "openpilot.system.hardware.hardwared", always_run),
   PythonProcess("modem", "openpilot.system.hardware.tici.modem", always_run, enabled=TICI),
   PythonProcess("tombstoned", "openpilot.system.tombstoned", always_run, enabled=not PC),
@@ -238,13 +203,6 @@ procs = [
 
   # C3x lite has no speaker; mirror alerts to the GPIO buzzer instead.
   PythonProcess("beep", "openpilot.selfdrive.controls.beep", c3x_lite, enabled=TICI),
-
-  # Wayon 360 라이브 스트리밍 서버 (config.json 존재 시 상시 기동, 오프로드 뷰어 접속 처리)
-  PythonProcess("wayon_live", "openpilot.system.wayon_live_stream", wayon_remote_ready, restart_if_crash=True),
-  # Cloudflare 터널 supervisor 영구화 (재부팅 후에도 원격 라이브뷰 유지, 오프로드 전용은 스크립트가 처리)
-  PythonProcess("wayon_remote", "openpilot.system.wayon_remote", wayon_remote_ready, restart_if_crash=True),
-  # ID.4 배터리/위치 텔레메트리 -> Wayon Cloud (앱의 배터리 잔량·주차위치 표시용)
-  PythonProcess("wayon_telemetry", "openpilot.system.wayon_vehicle_telemetry", wayon_remote_ready, restart_if_crash=True),
 ]
 
 managed_processes = {p.name: p for p in procs}

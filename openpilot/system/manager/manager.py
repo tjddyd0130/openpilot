@@ -12,8 +12,10 @@ import openpilot.cereal.messaging as messaging
 import openpilot.system.sentry as sentry
 from openpilot.common.utils import atomic_write
 from openpilot.common.params import Params, ParamKeyFlag
+from openpilot.common.repo_update import release_boot_lock
 from openpilot.common.text_window import TextWindow
 from openpilot.system.hardware import HARDWARE
+from openpilot.system.manager.camera_config import configure_wide_camera
 from openpilot.system.manager.helpers import unblock_stdout, write_onroad_params, save_bootlog
 from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
@@ -21,15 +23,6 @@ from openpilot.system.athena.registration import register, UNREGISTERED_DONGLE_I
 from openpilot.common.swaglog import cloudlog, add_file_handler
 from openpilot.system.version import get_build_metadata
 from openpilot.system.hardware.hw import Paths
-
-
-def migrate_legacy_carrot_radar_mode(params: Params) -> None:
-  legacy_value = params.get("RadarMotionMode")
-  if params.get("CarrotRadarMode") is None and legacy_value in (0, 1):
-    params.put("CarrotRadarMode", legacy_value)
-  if legacy_value is not None:
-    params.remove("RadarMotionMode")
-
 
 def set_default_params():
   params = Params()
@@ -44,6 +37,7 @@ def get_default_params_key():
   #default_params = get_default_params()
   #all_keys = [key for key, _ in default_params]
   #return all_keys
+
 
 def write_supported_cars_files() -> None:
   params_path = Params().get_param_path()
@@ -72,7 +66,6 @@ def manager_init() -> None:
   build_metadata = get_build_metadata()
 
   params = Params()
-  migrate_legacy_carrot_radar_mode(params)
   params.clear_all(ParamKeyFlag.CLEAR_ON_MANAGER_START)
   params.clear_all(ParamKeyFlag.CLEAR_ON_ONROAD_TRANSITION)
   params.clear_all(ParamKeyFlag.CLEAR_ON_OFFROAD_TRANSITION)
@@ -88,6 +81,8 @@ def manager_init() -> None:
     default_value = params.get_default_value(k)
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value)
+
+  configure_wide_camera(params)
 
   # Create folders needed for msgq
   try:
@@ -243,8 +238,11 @@ def manager_thread() -> None:
       break
 
 def main() -> None:
-  manager_init()
-  write_supported_cars_files()
+  try:
+    manager_init()
+    write_supported_cars_files()
+  finally:
+    release_boot_lock()
 
   if os.getenv("PREPAREONLY") is not None:
     return

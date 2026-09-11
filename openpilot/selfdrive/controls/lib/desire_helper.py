@@ -1,7 +1,5 @@
 from openpilot.cereal import log
-from openpilot.common.constants import CV
 from openpilot.common.realtime import DT_MDL
-import numpy as np
 from openpilot.common.params import Params
 
 from openpilot.selfdrive.controls.lib.desire_lib.constants import (
@@ -59,8 +57,6 @@ class DesireHelper:
     self.laneChangeBsd = 0
     self.laneLineCheck = 0
     self.laneChangeDelay = 0.0
-    self.modelTurnSpeedFactor = 0.0
-    self.model_turn_speed = 200.0
 
     # misc
     self.prev_desire_enabled = False
@@ -79,16 +75,6 @@ class DesireHelper:
       self.laneChangeBsd = self.params.get_int("LaneChangeBsd")
       self.laneLineCheck = self.params.get_int("LaneLineCheck")
       self.laneChangeDelay = self.params.get_float("LaneChangeDelay") * 0.1
-      self.modelTurnSpeedFactor = self.params.get_float("ModelTurnSpeedFactor") * 0.1
-
-  def _make_model_turn_speed(self, modeldata):
-    if self.modelTurnSpeedFactor > 0:
-      model_turn_speed = np.interp(self.modelTurnSpeedFactor,
-                                   modeldata.velocity.t,
-                                   modeldata.velocity.x) * CV.MS_TO_KPH * 1.2
-      self.model_turn_speed = self.model_turn_speed * 0.9 + model_turn_speed * 0.1
-    else:
-      self.model_turn_speed = 200.0
 
   def _check_desire_state(self, modeldata, carstate, maneuver_type):
     desire_state = modeldata.meta.desireState
@@ -189,8 +175,10 @@ class DesireHelper:
 
     # obstacles
     v_ego = carstate.vEgo
-    self.left.update_obstacles(v_ego, radarState.leadLeft, carstate.leftBlindspot, ignore_bsd, bsd_hold_sec=2.0)
-    self.right.update_obstacles(v_ego, radarState.leadRight, carstate.rightBlindspot, ignore_bsd, bsd_hold_sec=2.0)
+    self.left.update_obstacles(v_ego, radarState.leadLeft, carstate.leftBlindspot, ignore_bsd,
+                               bsd_hold_sec=2.0, radar_objects=radarState.leadsLeft)
+    self.right.update_obstacles(v_ego, radarState.leadRight, carstate.rightBlindspot, ignore_bsd,
+                                bsd_hold_sec=2.0, radar_objects=radarState.leadsRight)
 
     # compute available (include BSD+object)
     if self.laneLineCheck >= 1:
@@ -223,7 +211,6 @@ class DesireHelper:
   def update(self, carstate, modeldata, lateral_active, lane_change_prob, carrotMan, radarState):
     self.frame += 1
     self._update_params_periodic()
-    self._make_model_turn_speed(modeldata)
 
     # counts
     self.carrot_lane_change_count = max(0, self.carrot_lane_change_count - 1)
@@ -354,7 +341,9 @@ class DesireHelper:
         self.turn_direction = TurnDirection.none
 
         if self.lane_change_state == LaneChangeState.off:
-          if desire_enabled and not self.prev_desire_enabled and not below_lane_change_speed and side is not None:
+          driver_desire_started = driver_enabled and driver_changed
+          if desire_enabled and (not self.prev_desire_enabled or driver_desire_started) and \
+             not below_lane_change_speed and side is not None:
             self.lane_change_state = LaneChangeState.preLaneChange
             self.lane_change_ll_prob = 1.0
             self.lane_change_delay = self.laneChangeDelay
@@ -407,7 +396,6 @@ class DesireHelper:
                                     not atc_lane_change_retry_line_blocked
               start_gate = (side.lane_change_available_geom and self.lane_change_delay == 0) or \
                            side.lane_line_info_edge_detect or solid_line_blocked or block_released_auto or atc_line_release
-                
               if start_gate:
                 if solid_line_blocked:
                   if atc_line_release or (torque_applied and not (bsd_active and block_lanechange_bsd)):

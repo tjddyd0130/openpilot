@@ -7,7 +7,7 @@ from openpilot.cereal import car
 from openpilot.common.params import Params
 import openpilot.system.manager.manager as manager
 from openpilot.system.manager.process import ensure_running
-from openpilot.system.manager.process_config import managed_processes, procs
+from openpilot.system.manager.process_config import enable_youtube_wide_encoder, managed_processes, procs
 from openpilot.system.hardware import HARDWARE
 
 os.environ['FAKEUPLOAD'] = "1"
@@ -34,45 +34,30 @@ class TestManager:
   def test_duplicate_procs(self):
     assert len(procs) == len(managed_processes), "Duplicate process names"
 
-  def test_radard_modes_are_mutually_exclusive(self):
+  def test_wide_youtube_encoder_requires_wide_camera(self):
+    class FakeParams:
+      def __init__(self, use_wide_camera):
+        self.use_wide_camera = use_wide_camera
+
+      def get(self, key, return_default=False):
+        assert (key, return_default) == ("UseWideCamera", True)
+        return self.use_wide_camera
+
+      def get_int(self, key):
+        return {"CarrotYouTubeLive": 1, "CarrotYouTubeQuality": 3}[key]
+
+    assert enable_youtube_wide_encoder(True, FakeParams(True), car.CarParams.new_message())
+    assert not enable_youtube_wide_encoder(True, FakeParams(False), car.CarParams.new_message())
+
+  def test_radard_is_always_carrot_radar(self):
     CP = car.CarParams.new_message()
     params = Params()
+    process = managed_processes["radard"]
 
-    params.put("CarrotRadarMode", "0")
-    assert not managed_processes["radard"].should_run(False, params, CP)
-    assert not managed_processes["radard_dpath"].should_run(False, params, CP)
-    assert managed_processes["radard"].should_run(True, params, CP)
-    assert not managed_processes["radard_dpath"].should_run(True, params, CP)
-
-    params.put("CarrotRadarMode", "1")
-    # A live parameter write must not replace the radar publisher mid-drive.
-    assert managed_processes["radard"].should_run(True, params, CP)
-    assert not managed_processes["radard_dpath"].should_run(True, params, CP)
-
-    # The next off-road-to-on-road transition applies the new mode.
-    assert not managed_processes["radard"].should_run(False, params, CP)
-    assert not managed_processes["radard_dpath"].should_run(False, params, CP)
-    assert not managed_processes["radard"].should_run(True, params, CP)
-    assert managed_processes["radard_dpath"].should_run(True, params, CP)
-    assert not managed_processes["radard"].should_run(False, params, CP)
-    assert not managed_processes["radard_dpath"].should_run(False, params, CP)
-
-  def test_legacy_radar_motion_mode_is_migrated_once(self):
-    params = Params()
-    params.remove("CarrotRadarMode")
-    params.put("RadarMotionMode", "1")
-
-    manager.migrate_legacy_carrot_radar_mode(params)
-
-    assert params.get_int("CarrotRadarMode") == 1
-    assert params.get("RadarMotionMode") is None
-
-    params.put("CarrotRadarMode", "0")
-    params.put("RadarMotionMode", "1")
-    manager.migrate_legacy_carrot_radar_mode(params)
-
-    assert params.get_int("CarrotRadarMode") == 0
-    assert params.get("RadarMotionMode") is None
+    assert "radard_dpath" not in managed_processes
+    assert process.module == "openpilot.selfdrive.carrot.radar.radard_dpath"
+    assert not process.should_run(False, params, CP)
+    assert process.should_run(True, params, CP)
 
   def test_carrot_navi_is_permanent_7714_owner(self):
     process = managed_processes["carrot_navi"]
@@ -89,10 +74,13 @@ class TestManager:
     CP.notCar = False
     params = Params()
     params.put("DisableDM", "2")
-    params.put_bool("CarrotVisionActive", True)
+    params.put_bool("CarrotVisionActive", False)
 
     params.put("ClusterHud", "0")
+    assert not managed_processes["carrot_vision_encoderd"].should_run(False, params, CP)
     assert managed_processes["carrot_webrtcd"].should_run(True, params, CP)
+    assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
+    params.put_bool("CarrotVisionActive", True)
     assert managed_processes["carrot_vision_encoderd"].should_run(True, params, CP)
 
     params.put("ClusterHud", "1")

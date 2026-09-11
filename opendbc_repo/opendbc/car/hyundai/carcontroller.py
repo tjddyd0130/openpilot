@@ -1,3 +1,5 @@
+from collections import deque
+
 import numpy as np
 from opendbc.can import CANPacker
 from opendbc.car import Bus, DT_CTRL, apply_driver_steer_torque_limits, common_fault_avoidance, make_tester_present_msg, structs, apply_std_steer_angle_limits
@@ -8,6 +10,7 @@ from opendbc.car.hyundai.hyundaicanfd import CanBus
 from opendbc.car.hyundai.values import HyundaiFlags, Buttons, CarControllerParams, CAR, CAN_GEARS, HyundaiExtFlags
 from opendbc.car.interfaces import CarControllerBase
 from opendbc.car.vehicle_model import VehicleModel
+from openpilot.common.filter_simple import MyMovingAverage
 
 VisualAlert = structs.CarControl.HUDControl.VisualAlert
 LongCtrlState = structs.CarControl.Actuators.LongControlState
@@ -31,6 +34,19 @@ PRE_OVERRIDE_CONFIRM_FRAMES = 2
 PRE_OVERRIDE_MAX_TORQUE_DELTA = -10.0
 LOW_SPEED_ANGLE_RATE_RAMP_SPEED = 15.0 * CV.KPH_TO_MS
 MID_SPEED_ANGLE_RATE_LIMIT_SPEED = 40.0 * CV.KPH_TO_MS
+LARGE_ANGLE_UNWIND_RATE = 1.5  # deg/tick: allow a quicker return from the EPS fault-angle region
+CANFD_JERK_UPPER_MIN = 1.0
+CANFD_JERK_LIMIT_MAX = 5.0
+CANFD_JERK_ERROR_DELAY = 0.5
+CANFD_JERK_ERROR_FILTER_TIME = 0.4
+CANFD_JERK_ERROR_DEADBAND = 0.25
+CANFD_JERK_ERROR_FULL_SCALE = 0.5
+CANFD_JERK_RELEASE_THRESHOLD = 0.1
+# Some CAN-FD SCC implementations need a higher lower-jerk limit to follow sustained
+# deceleration requests. Keep the historical MPC-jerk limit as the default and blend
+# toward this stock-like feedforward only after measured under-deceleration.
+CANFD_JERK_LOWER_ACCEL_BP = [0.0, 0.8, 1.2, 1.5, 2.0, 2.5, 3.2]
+CANFD_JERK_LOWER_LIMIT_V = [1.2, 1.2, 1.2, 1.7, 3.0, 3.3, 3.7]
 
 # KIA_EV_SK3 note: do NOT toggle/knock the LKAS request bit to coax the MDPS into starting.
 # Field-tested and removed twice: (a) toggling with ToiFlt=1 faults the MDPS; (b) brief clean
@@ -74,6 +90,24 @@ def process_hud_alert(enabled, fingerprint, hud_control):
 
 def rate_limit(x, x_last, lo, hi):
   return float(np.clip(x, x_last + lo, x_last + hi))
+
+
+def calculate_canfd_jerk_limits(accel: float, jerk: float, tracking_error: float = 0.0) -> tuple[float, float]:
+  jerk_u = np.clip(jerk * 2.0, CANFD_JERK_UPPER_MIN, CANFD_JERK_LIMIT_MAX)
+  jerk_l_mpc = np.clip(-jerk * 4.0, 1.0, CANFD_JERK_LIMIT_MAX)
+
+  # A clearly positive jerk means the plan is releasing deceleration. In that case, or when
+  # the vehicle is already tracking the request, return to the historical jerk-based
+  # limit immediately instead of allowing acceleration demand alone to hold braking.
+  assist_ratio = 0.0
+  if jerk <= CANFD_JERK_RELEASE_THRESHOLD:
+    assist_ratio = np.clip((tracking_error - CANFD_JERK_ERROR_DEADBAND) / CANFD_JERK_ERROR_FULL_SCALE, 0.0, 1.0)
+
+  decel_request = max(0.0, -accel)
+  jerk_l_feedforward = np.interp(decel_request, CANFD_JERK_LOWER_ACCEL_BP, CANFD_JERK_LOWER_LIMIT_V)
+  jerk_l_assist = 1.0 + assist_ratio * (jerk_l_feedforward - 1.0)
+  jerk_l = np.clip(max(jerk_l_mpc, jerk_l_assist), 1.0, CANFD_JERK_LIMIT_MAX)
+  return float(jerk_u), float(jerk_l)
 
 def apply_steer_angle_limits_physics(desired_sw_deg: float,
                                      last_sw_deg: float,
@@ -121,6 +155,13 @@ def apply_steer_angle_limits_physics(desired_sw_deg: float,
   if err > 20.0:
     max_sw_rate_deg_per_tick = min(max_sw_rate_deg_per_tick, 1.0)
 
+  # Once steering is in the large-angle region, do not make the return toward center wait on
+  # the normal low-speed/large-error cap. This only relaxes unwinding; winding farther into the
+  # turn keeps all existing limits.
+  unwinding_large_angle = abs(last_sw_deg) >= MAX_ANGLE and last_sw_deg * (target_sw - last_sw_deg) < 0.0
+  if unwinding_large_angle:
+    max_sw_rate_deg_per_tick = max(max_sw_rate_deg_per_tick, LARGE_ANGLE_UNWIND_RATE)
+
   max_drw_per_tick_deg = min(
     max_drw_per_tick_deg,
     max_sw_rate_deg_per_tick / steer_ratio
@@ -149,6 +190,7 @@ class CarController(CarControllerBase):
     self.mdps_noact_frames = 0
 
     self.accel_last = 0
+    self.accel_value_last = 0.0
     self.apply_torque_last = 0
     self.car_fingerprint = CP.carFingerprint
     self.last_button_frame = 0
@@ -194,6 +236,7 @@ class CarController(CarControllerBase):
     self.camera_scc_params = Params().get_int("HyundaiCameraSCC")
     self.is_ldws_car = Params().get_bool("IsLdwsCar")
     self.enable_corner_radar = 0
+    self.paddle_mode = Params().get_int("PaddleMode")
 
     self.steerDeltaUpOrg = self.steerDeltaUp = self.steerDeltaUpLC = self.params.STEER_DELTA_UP
     self.steerDeltaDownOrg = self.steerDeltaDown = self.steerDeltaDownLC = self.params.STEER_DELTA_DOWN
@@ -241,6 +284,7 @@ class CarController(CarControllerBase):
       self.canfd_debug = params.get_int("CanfdDebug")
       self.camera_scc_params = params.get_int("HyundaiCameraSCC")
       self.enable_corner_radar = params.get_int("EnableCornerRadar")
+      self.paddle_mode = params.get_int("PaddleMode")
 
     actuators = CC.actuators
     hud_control = CC.hudControl
@@ -518,22 +562,29 @@ class CarController(CarControllerBase):
         self.hyundai_jerk.check_carrot_cruise(CC, CS, hud_control, stopping, accel, actuators.aTarget)
 
         if True: #not camera_scc:
-          can_sends.extend(hyundaicanfd.create_ccnc_messages(self.CP, self.packer, self.CAN, self.frame, CC, CS, hud_control, apply_angle, left_lane_warning, right_lane_warning, self.enable_corner_radar, stopping, self.canfd_debug))
+          can_sends.extend(hyundaicanfd.create_ccnc_messages(
+            self.CP, self.packer, self.CAN, self.frame, CC, CS, hud_control, apply_angle,
+            left_lane_warning, right_lane_warning, self.enable_corner_radar, stopping,
+            self.canfd_debug, self.paddle_mode,
+          ))
           if hda2:
             can_sends.extend(hyundaicanfd.create_adrv_messages(self.CP, self.packer, self.CAN, self.frame))
           else:
             can_sends.extend(hyundaicanfd.create_fca_warning_light(self.CP, self.packer, self.CAN, self.frame))
         if self.frame % 2 == 0:
           if self.CP.flags & HyundaiFlags.CAMERA_SCC.value:
-            msg = hyundaicanfd.create_acc_control_scc2(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                             set_speed_in_units, hud_control, self.hyundai_jerk, CS)
+            msg, self.accel_value_last = hyundaicanfd.create_acc_control_scc2(
+              self.packer, self.CAN, CC.enabled, self.accel_value_last, accel, stopping, CC.cruiseControl.override,
+              set_speed_in_units, hud_control, self.hyundai_jerk, CS,
+            )
             if msg is not None:
               can_sends.append(msg)
             can_sends.extend(hyundaicanfd.create_tcs_messages(self.packer, self.CAN, CS)) # for sorento SCC radar...
           else:
-            can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping, CC.cruiseControl.override,
-                                                             set_speed_in_units, hud_control, self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
-          self.accel_last = accel
+            can_sends.append(hyundaicanfd.create_acc_control(self.packer, self.CAN, CC.enabled, self.accel_last, accel, stopping,
+                                                             CC.cruiseControl.override, set_speed_in_units, hud_control,
+                                                             self.hyundai_jerk.jerk_u, self.hyundai_jerk.jerk_l, CS))
+            self.accel_last = accel
       else:
         # button presses
         if self.camera_scc_params == 3: # camera scc but stock long
@@ -607,7 +658,7 @@ class CarController(CarControllerBase):
 
   def create_button_messages(self, CC: structs.CarControl, CS: CarState, use_clu11: bool):
     can_sends = []
-    if CS.out.brakePressed or CS.out.brakeHoldActive:
+    if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
       return can_sends
     if use_clu11:
       if CS.clu11 is None:
@@ -682,6 +733,9 @@ class CarController(CarControllerBase):
     trigger_start = 6
     self.MainMode_ACC_trigger = max(trigger_min, self.MainMode_ACC_trigger - 1)
     self.LFA_trigger = max(trigger_min, self.LFA_trigger - 1)
+    if CS.out.brakeHoldActive or CS.out.parkingBrake:
+      self.MainMode_ACC_trigger = trigger_min
+      return
     if self.MainMode_ACC_trigger == trigger_min and self.LFA_trigger == trigger_min:
       if CC.enabled and not CS.MainMode_ACC and CS.out.vEgo > 3.:
         self.MainMode_ACC_trigger = trigger_start
@@ -706,6 +760,10 @@ class CarController(CarControllerBase):
 
 
   def make_spam_button(self, CC, CS):
+    if CS.out.brakePressed or CS.out.brakeHoldActive or CS.out.parkingBrake:
+      self.activateCruise = 0
+      return 0
+
     hud_control = CC.hudControl
     set_speed_in_units = hud_control.setSpeed * (CV.MS_TO_KPH if CS.is_metric else CV.MS_TO_MPH)
     target = int(set_speed_in_units+0.5)
@@ -764,7 +822,6 @@ class CarController(CarControllerBase):
       self.button_spamming_count = 0
     return 0
 
-from openpilot.common.filter_simple import MyMovingAverage
 class HyundaiJerk:
   def __init__(self):
     self.params = Params()
@@ -774,6 +831,8 @@ class HyundaiJerk:
     self.jerk_u_min = 0.5
     self.carrot_cruise = 1
     self.carrot_cruise_accel = 0.0
+    self.accel_request_history = deque(maxlen=max(1, round(CANFD_JERK_ERROR_DELAY / DT_CTRL)))
+    self.jerk_error_filter = MyMovingAverage(max(1, round(CANFD_JERK_ERROR_FILTER_TIME / DT_CTRL)), 0.0)
 
   def check_carrot_cruise(self, CC, CS, hud_control, stopping, accel, a_target):
     carrot_cruise_decel = self.params.get_float("CarrotCruiseDecel")
@@ -796,29 +855,50 @@ class HyundaiJerk:
       self.carrot_cruise_accel = CS.out.aEgo
 
   def make_jerk(self, CP, CS, accel, actuators, hud_control):
+    canfd = bool(CP.flags & HyundaiFlags.CANFD)
+    jerk_u_min = CANFD_JERK_UPPER_MIN if canfd else self.jerk_u_min
     if actuators.longControlState == LongCtrlState.stopping:
-      self.jerk = self.jerk_u_min / 2 - CS.out.aEgo
+      self.jerk = jerk_u_min / 2 - CS.out.aEgo
     else:
       jerk = actuators.jerk if actuators.longControlState == LongCtrlState.pid else 0.0
       #a_error = actuators.aTarget - CS.out.aEgo
       self.jerk = jerk# + a_error
 
-    jerk_max_l = 5.0
+    jerk_max_l = CANFD_JERK_LIMIT_MAX
     jerk_max_u = jerk_max_l
     if actuators.longControlState == LongCtrlState.off:
       self.jerk_u = jerk_max_u
       self.jerk_l = jerk_max_l
       self.cb_upper = self.cb_lower = 0.0
+      self.accel_request_history.clear()
+      self.jerk_error_filter.set_all(0.0)
     else:
-      if CP.flags & HyundaiFlags.CANFD:
-        # Keep deceleration authority after the MPC jerk settles to zero. Stock SCC raises the
-        # lower jerk limit with the raw acceleration request instead of relying on jerk alone.
-        jerk_l_base = 1.2
-        jerk_l_raw = np.clip(jerk_l_base + 2.0 * max(0.0, -accel - 2.8), jerk_l_base, jerk_max_l)
-        jerk_l_mpc = np.clip(-self.jerk * 4.0, jerk_l_base, jerk_max_l)
+      if canfd:
+        tracking_error = 0.0
+        tracking_error_active = actuators.longControlState == LongCtrlState.pid and not CS.out.brakePressed and not CS.out.gasPressed
+        if tracking_error_active:
+          self.accel_request_history.append(float(accel))
+          request_is_sustained = False
+          if len(self.accel_request_history) == self.accel_request_history.maxlen:
+            delayed_accel = self.accel_request_history[0]
+            request_is_sustained = delayed_accel < -1.0 and accel < -1.0 and abs(accel - delayed_accel) < 0.5
+            if request_is_sustained:
+              # Only assist when measured deceleration is weaker than both the
+              # current request and the delay-aligned request. The current-request
+              # comparison makes the assist release promptly while aReq unwinds.
+              tracking_error = min(CS.out.aEgo - delayed_accel, CS.out.aEgo - accel)
+          # Require sustained measured under-deceleration before slowly enabling
+          # feedforward. Release it immediately once the plan unwinds or the vehicle
+          # meets/exceeds either request, avoiding a filtered braking tail.
+          if request_is_sustained and self.jerk <= CANFD_JERK_RELEASE_THRESHOLD and tracking_error > 0.0:
+            filtered_tracking_error = self.jerk_error_filter.process(tracking_error)
+          else:
+            filtered_tracking_error = self.jerk_error_filter.set_all(0.0)
+        else:
+          self.accel_request_history.clear()
+          filtered_tracking_error = self.jerk_error_filter.set_all(0.0)
 
-        self.jerk_u = min(max(self.jerk_u_min, self.jerk * 2.0), jerk_max_u)
-        self.jerk_l = max(jerk_l_raw, jerk_l_mpc)
+        self.jerk_u, self.jerk_l = calculate_canfd_jerk_limits(accel, self.jerk, filtered_tracking_error)
         self.cb_upper = self.cb_lower = 0.0
       else:
         self.jerk_u = min(max(self.jerk_u_min, self.jerk * 2.0), jerk_max_u)

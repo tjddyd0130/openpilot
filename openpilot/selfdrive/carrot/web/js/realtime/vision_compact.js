@@ -115,6 +115,7 @@ window.CarrotVisionCompact = (() => {
     [3, ["deviceState", [
       ["memoryUsagePercent", "i8"], ["freeSpacePercent", "f32"], ["cpuTempC", "f32list"],
       ["deviceType", "enumname", ["unknown", "neo", "chffrAndroid", "chffrIos", "tici", "pc", "tizi", "mici"]],
+      ["started", "bool"],
     ]]],
     [4, ["peripheralState", [["voltage", "u32"]]]],
     [5, ["carrotMan", [
@@ -126,6 +127,8 @@ window.CarrotVisionCompact = (() => {
       ["xPosLon", "f32"], ["xPosAngle", "f32"], ["xPosSpeed", "f32"],
       ["trafficState", "i32"], ["nGoPosDist", "i32"], ["nGoPosTime", "i32"],
       ["szSdiDescr", "text"], ["naviPaths", "text"], ["desiredSource", "text"],
+      ["vehicleNaviActive", "bool"], ["vehicleNaviSpeed", "i32"], ["vehicleNaviSectionActive", "bool"],
+      ["vehicleNaviAvailable", "bool"],
     ]]],
     [6, ["selfdriveState", [
       ["enabled", "bool"], ["personality", "u8"], ["alertStatus", "u8"],

@@ -231,6 +231,8 @@ SERVICE_SCHEMAS: dict[str, tuple[int, tuple[tuple[Any, ...], ...]]] = {
     ("freeSpacePercent", "f32"),
     ("cpuTempC", "f32_list"),
     ("deviceType", ("enum", ("unknown", "neo", "chffrAndroid", "chffrIos", "tici", "pc", "tizi", "mici"))),
+    # Appended for HUD power policy. Older compact clients ignore trailing fields.
+    ("started", "bool"),
   )),
   "peripheralState": (4, (
     ("voltage", "u32"),
@@ -259,6 +261,10 @@ SERVICE_SCHEMAS: dict[str, tuple[int, tuple[tuple[Any, ...], ...]]] = {
     ("szSdiDescr", "text"),
     ("naviPaths", "text"),
     ("desiredSource", "text"),
+    ("vehicleNaviActive", "bool"),
+    ("vehicleNaviSpeed", "i32"),
+    ("vehicleNaviSectionActive", "bool"),
+    ("vehicleNaviAvailable", "bool"),
   )),
   "selfdriveState": (6, (
     ("enabled", "bool"),
@@ -429,7 +435,9 @@ CARROT_STATE_SERVICES = tuple(SERVICE_SCHEMAS.keys())
 # instead of flooding the browser with every message stored in rlog.
 COMPACT_SERVICE_INTERVALS = {
   "modelV2": 0.05,
-  "carState": 0.03,
+  # Steering-driven HUDs need the freshest carState sample. 60 Hz polling plus
+  # the compact batch window keeps end-to-end input latency near one frame.
+  "carState": 0.016,
   "controlsState": 0.03,
   "longitudinalPlan": 0.05,
   "carControl": 0.03,
@@ -456,7 +464,7 @@ COMPACT_SERVICE_INTERVALS = {
   "liveDelay": 0.25,
 }
 COMPACT_SERVICE_INTERVAL_DEFAULT = 0.05
-COMPACT_BATCH_WINDOW_SECONDS = 0.012
+COMPACT_BATCH_WINDOW_SECONDS = 0.006
 
 
 def compact_service_interval(service: str) -> float:

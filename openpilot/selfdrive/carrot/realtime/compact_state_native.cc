@@ -625,6 +625,7 @@ void encode_device_state(std::string &out, const DynamicReader &value) {
   append_f32(out, value, "freeSpacePercent");
   append_f32_list(out, value, "cpuTempC");
   append_enum(out, value, "deviceType");
+  append_bool(out, value, "started");
 }
 
 void encode_carrot_man(std::string &out, const DynamicReader &value) {
@@ -651,6 +652,10 @@ void encode_carrot_man(std::string &out, const DynamicReader &value) {
   append_text(out, value, "szSdiDescr");
   append_text(out, value, "naviPaths");
   append_text(out, value, "desiredSource");
+  append_bool(out, value, "vehicleNaviActive");
+  append_i32(out, value, "vehicleNaviSpeed");
+  append_bool(out, value, "vehicleNaviSectionActive");
+  append_bool(out, value, "vehicleNaviAvailable");
 }
 
 void encode_selfdrive_state(std::string &out, const DynamicReader &value) {
