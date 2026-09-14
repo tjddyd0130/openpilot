@@ -52,7 +52,7 @@ Record the value currently shown on the device before changing anything.
 <a id="speed-camera"></a>
 ## 1. Speed cameras
 
-The related settings are `AutoNaviSpeedCtrlMode`, `AutoNaviSpeedCtrlEnd`, `AutoNaviSpeedDecelRate`, `AutoNaviSpeedSafetyFactor`, `AutoNaviCountDownMode`, `VehicleNaviCanControl`, `VehicleNaviSchoolZoneControl`, `VehicleSpeedCameraControlMode`, and `VehicleSpeedCameraDistanceTime`.
+The related settings are `AutoNaviSpeedCtrlMode`, `AutoNaviSpeedCtrlEnd`, `AutoNaviRearCameraHoldDistance`, `AutoNaviSpeedDecelRate`, `AutoNaviSpeedSafetyFactor`, `AutoNaviCountDownMode`, `VehicleNaviCanControl`, `VehicleNaviSchoolZoneControl`, `VehicleSpeedCameraControlMode`, and `VehicleSpeedCameraDistanceTime`.
 
 ### `AutoNaviSpeedCtrlMode`
 
@@ -67,7 +67,11 @@ The event type, limit, and distance must all be valid. An average-speed zone ret
 
 ### Stock-navigation CAN control
 
-`VehicleNaviCanControl` selects when exact camera and speed-bump distances from stock navigation are used on supported Hyundai/Kia CAN-FD vehicles. The previous enabled value, `1`, remains the always-apply mode.
+When external navigation is connected, deceleration and countdowns use external navigation only. Stock cameras, bumps, sections, 30 km/h zone caps, and stock-navigation speed displays are excluded even if external navigation has no current guidance or enforcement item. After disconnection or receive timeout is detected, stock navigation becomes available again according to its settings.
+
+`VehicleNaviCanControl` selects when exact camera and speed-bump distances from stock navigation are used on supported Hyundai/Kia CAN-FD vehicles. The modes below apply only without an external navigation connection. Always apply in mode `1` means independent of stock route guidance.
+
+A current camera warning is associated only with a nearby distance candidate with the same limit. If only a distant same-speed camera is available, the current warning uses its own virtual distance while the distant camera remains queued for a later approach.
 
 | Value | vNAVI future-event scope |
 |---:|---|
@@ -100,6 +104,16 @@ In mode `2`, an accelerator held from before actual deceleration begins does not
 ### `VehicleSpeedCameraDistanceTime`
 
 When the vehicle supplies only an enforcement speed without an exact camera distance, this setting creates a virtual deceleration distance. At a 50 km/h camera, `6.0 s` produces about 300 m and `6.2 s` about 310 m. A live change is applied within about one second.
+
+On supported CAN-FD vehicles, this also applies when no nearby camera distance matches the current warning. A new warning or a limit change starts a fresh virtual distance, which decreases with travel. Once the distance is exhausted, the cap remains while the warning is active; the virtual distance does not repeatedly restart at its full length.
+
+### `AutoNaviRearCameraHoldDistance`
+
+When external navigation reports a rear speed or rear signal-and-speed camera (TMAP types `75/76`), keep the target-speed cap beyond the camera position. The default is **100 m**, the range is **0–300 m**, and the step is **10 m**. `0` disables the extra hold. Increasing the value holds farther beyond the camera; decreasing it releases sooner.
+
+The camera position is captured within the final 50 m and then tracked by traveled distance. The hold survives guidance removal or a switch to the next camera or bump. A lower speed required by another control still takes precedence. Stopping does not consume the hold distance. The display shows the rear-camera hold and remaining distance; the countdown ends at the original camera position.
+
+External disconnection, off-route status, a new navigation session, a traveled-distance reset, or disabling camera deceleration clears the hold. Stock CAN does not identify rear-camera types, so it uses its active warning to retain the cap without this extra distance. The configured distance does not guarantee that measurement by the actual camera has ended.
 
 ### `AutoNaviSpeedSafetyFactor`
 
@@ -145,7 +159,7 @@ If slowing begins too late, lower this value one step. If it begins too early, r
 | `1` | Turn points and speed events, excluding bumps |
 | `2` | Turn points, speed events, and bumps |
 
-The countdown estimates seconds from distance and current speed. It does not alter the deceleration calculation.
+The countdown uses only external-navigation distances while connected, and stock-navigation distances otherwise. Changing the connection state resets the previous countdown. It estimates seconds from distance and current speed and does not alter the deceleration calculation.
 
 Recommended tuning order: validate event data, set the target with `SafetyFactor`, set the completion position with `CtrlEnd`, and finally tune the approach curve with `DecelRate`.
 
