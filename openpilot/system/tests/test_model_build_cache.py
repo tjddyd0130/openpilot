@@ -1,4 +1,5 @@
 import ast
+import json
 import os
 import shlex
 import shutil
@@ -81,7 +82,7 @@ def test_optional_model_reuse_checks_dependencies(tmp_path: Path, monkeypatch, e
   assert manifest_path.exists() is exists  # Preserve old artifacts through transient failures.
 
 
-@pytest.mark.parametrize('delivery', ['available', 'missing', 'invalid'])
+@pytest.mark.parametrize('delivery', ['available', 'missing', 'invalid', 'pcie_off', 'usb_reset', 'worker_timeout', 'validation_timeout'])
 def test_precompiled_delivery_or_local_compile_fallback(tmp_path, monkeypatch, delivery):
   tree = ast.parse((Path(BASEDIR) / 'openpilot/system/manager/build.py').read_text(encoding='utf8'))
   body = [n for n in tree.body if isinstance(n, ast.Assign) and any(
@@ -95,6 +96,7 @@ def test_precompiled_delivery_or_local_compile_fallback(tmp_path, monkeypatch, d
   monkeypatch.setattr(helpers, 'usbgpu_present', lambda: True)
   monkeypatch.setattr(big_model_status, 'write_big_model_status', lambda *a, **kw: None)
   path = tmp_path / 'model.pkl'
+  (tmp_path / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'a' * 64}}))
   def ensure(*a, **kw):
     if delivery == 'missing':
       raise FileNotFoundError('no precompiled artifact')
@@ -105,17 +107,27 @@ def test_precompiled_delivery_or_local_compile_fallback(tmp_path, monkeypatch, d
   monkeypatch.setitem(sys.modules, 'openpilot.system.hardware.usbgpu', SimpleNamespace(check_usbgpu=lambda **kw: None))
   def validate(command, **kw):
     assert 'openpilot.selfdrive.modeld.precompiled_runner' in command
+    assert kw['stderr'] == subprocess.STDOUT and kw['text']
     if delivery == 'invalid':
-      raise subprocess.CalledProcessError(1, command)
-    return SimpleNamespace(returncode=0)
+      raise subprocess.CalledProcessError(1, command, output='ValueError: incompatible model metadata\n')
+    if delivery == 'worker_timeout':
+      raise subprocess.CalledProcessError(1, command, output='TimeoutError: precompiled eGPU worker timed out\n')
+    if delivery == 'validation_timeout':
+      raise subprocess.TimeoutExpired(command, 120)
+    if delivery in ('pcie_off', 'usb_reset'):
+      output = ('RuntimeError: PCIe link not up (LTSSM=0x00), custom firmware not ready\n'
+                if delivery == 'pcie_off' else 'RuntimeError: USB bridge reset failed\n')
+      raise subprocess.CalledProcessError(1, command, output=output)
+    return SimpleNamespace(returncode=0, stdout='')
   def compile_local(command, **kw):
     assert command[0:3] == ['scons', '-j1', '--cache-populate']
     raise RuntimeError('local compiler was invoked')
   namespace = {'Path': Path, 'Spinner': object, 'BASEDIR': str(tmp_path), 'get_manifest_path': get_manifest_path,
                'os': os, 'sys': sys, 'time': SimpleNamespace(time=lambda: 0),
-               'subprocess': SimpleNamespace(run=validate, Popen=compile_local, PIPE=-1, STDOUT=-2)}
+               'subprocess': SimpleNamespace(run=validate, Popen=compile_local, PIPE=-1, STDOUT=-2,
+                                             TimeoutExpired=subprocess.TimeoutExpired)}
   exec(compile(ast.Module(body=body, type_ignores=[]), '<optional model build>', 'exec'), namespace)
-  if delivery == 'available':
+  if delivery in ('available', 'pcie_off', 'usb_reset', 'worker_timeout', 'validation_timeout'):
     assert namespace['build_usbgpu_model'](SimpleNamespace(update=lambda text: None))
   else:
     with pytest.raises(RuntimeError, match='local compiler was invoked'):

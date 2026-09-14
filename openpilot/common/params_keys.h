@@ -236,6 +236,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoTurnMapChange", {PERSISTENT, INT, "0"}},
 
     {"AutoNaviSpeedCtrlEnd", {PERSISTENT, INT, "7"}},
+    {"AutoNaviRearCameraHoldDistance", {PERSISTENT, INT, "100"}},
     {"AutoNaviSpeedCtrlMode", {PERSISTENT, INT, "2"}},
     {"VehicleNaviCanControl", {PERSISTENT, INT, "0"}},
     {"VehicleNaviSchoolZoneControl", {PERSISTENT, BOOL, "0"}},
@@ -316,15 +317,20 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SoundVolumeAdjustEngage", {PERSISTENT, INT, "10"}},
     {"SoundLanguageSetting", {PERSISTENT, STRING, "auto"}},
 
+    {"CruiseGapLevels", {PERSISTENT, INT, "4"}},
     {"TFollowGap1", {PERSISTENT, INT, "110"}},
     {"TFollowGap2", {PERSISTENT, INT, "120"}},
     {"TFollowGap3", {PERSISTENT, INT, "140"}},
     {"TFollowGap4", {PERSISTENT, INT, "160"}},
 
     {"LeadAccelResponse", {PERSISTENT, INT, "0"}},
+    {"LeadAccelResponseTF1", {PERSISTENT, INT, "-1"}},
+    {"LeadAccelResponseTF2", {PERSISTENT, INT, "-1"}},
+    {"LeadAccelResponseTF3", {PERSISTENT, INT, "-1"}},
+    {"LeadAccelResponseTF4", {PERSISTENT, INT, "-1"}},
     {"DynamicTFollowLC", {PERSISTENT, INT, "100"}},
     {"TFollowDecelBoost", {PERSISTENT, INT, "0"}},
-    {"EnableSpeedTF", {PERSISTENT, INT, "0"}},
+    {"SpeedTFFactor", {PERSISTENT, INT, "10"}},
     {"AChangeCostStarting", {PERSISTENT, INT, "10"}},
     {"TrafficStopDistanceAdjust", {PERSISTENT, INT, "-150"}},
 
