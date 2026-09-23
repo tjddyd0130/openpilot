@@ -5,6 +5,8 @@ from openpilot.selfdrive.controls.lib.drive_helpers import CONTROL_N
 from openpilot.common.pid import PIDController
 from openpilot.selfdrive.modeld.constants import ModelConstants
 from openpilot.common.params import Params
+from opendbc.car.hyundai.values import HyundaiFlags
+from opendbc.car.hyundai.stopping import converge_stopping_accel
 
 CONTROL_N_T_IDX = ModelConstants.T_IDXS[:CONTROL_N]
 
@@ -17,8 +19,11 @@ LongCtrlState = car.CarControl.Actuators.LongControlState
 
 
 def long_control_state_trans(CP, active, long_control_state, v_ego,
-                             should_stop, brake_pressed, cruise_standstill, a_ego, stopping_accel, radarState):
+                             should_stop, brake_pressed, cruise_standstill, a_ego, stopping_accel, radarState,
+                             canfd_stopping=False):
   stopping_condition = should_stop
+  stopping_accel = stopping_accel if stopping_accel < 0.0 else -0.5
+  stop_ready = a_ego >= stopping_accel
   starting_condition = (not should_stop and
                         not cruise_standstill and
                         not brake_pressed)
@@ -29,7 +34,7 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
 
   else:
     if long_control_state == LongCtrlState.off:
-      if not starting_condition:
+      if not starting_condition and (not canfd_stopping or stop_ready):
         long_control_state = LongCtrlState.stopping
       else:
         if starting_condition and CP.startingState:
@@ -45,13 +50,13 @@ def long_control_state_trans(CP, active, long_control_state, v_ego,
 
     elif long_control_state in [LongCtrlState.starting, LongCtrlState.pid]:
       if stopping_condition:
-        stopping_accel = stopping_accel if stopping_accel < 0.0 else -0.5
         leadOne = radarState.leadOne
         fcw_stop = leadOne.status and leadOne.dRel < 4.0
-        if a_ego > stopping_accel or fcw_stop: # and v_ego < 1.0:
+        enter_stopping = stop_ready if canfd_stopping else (a_ego > stopping_accel or fcw_stop)
+        if enter_stopping:
           long_control_state = LongCtrlState.stopping
-        if long_control_state == LongCtrlState.starting:
-          long_control_state = LongCtrlState.stopping
+        elif long_control_state == LongCtrlState.starting:
+          long_control_state = LongCtrlState.pid if canfd_stopping else LongCtrlState.stopping
       elif started_condition:
         long_control_state = LongCtrlState.pid
   return long_control_state
@@ -69,6 +74,8 @@ class LongControl:
     self.params = Params()
     self.readParamCount = 0
     self.stopping_accel = STOPPING_ACCEL
+    self.canfd_stopping = (CP.brand == "hyundai" and bool(CP.flags & HyundaiFlags.CANFD)
+                          and CP.openpilotLongitudinalControl)
     self.j_lead = 0.0
 
     self.hyundai_fixed_longitudinal_tuning = CP.brand == "hyundai"
@@ -121,7 +128,8 @@ class LongControl:
 
     self.long_control_state = long_control_state_trans(self.CP, active, self.long_control_state, CS.vEgo,
                                                        should_stop, CS.brakePressed,
-                                                       CS.cruiseState.standstill, CS.aEgo, self.stopping_accel, radarState)
+                                                       CS.cruiseState.standstill, CS.aEgo, self.stopping_accel, radarState,
+                                                       canfd_stopping=self.canfd_stopping)
     if active and soft_hold_active:
       self.long_control_state = LongCtrlState.stopping
 
@@ -132,12 +140,14 @@ class LongControl:
     elif self.long_control_state == LongCtrlState.stopping:
       output_accel = self.last_output_accel
 
-      if soft_hold_active:
-        output_accel = self.CP.stopAccel
-
-      if output_accel > self.stopping_accel:
-        output_accel = min(output_accel, 0.0)
-        output_accel -= self.CP.stoppingDecelRate * DT_CTRL
+      if self.canfd_stopping:
+        output_accel = converge_stopping_accel(output_accel, self.stopping_accel, self.CP.stoppingDecelRate, DT_CTRL)
+      else:
+        if soft_hold_active:
+          output_accel = self.CP.stopAccel
+        if output_accel > self.stopping_accel:
+          output_accel = min(output_accel, 0.0)
+          output_accel -= self.CP.stoppingDecelRate * DT_CTRL
       self.reset()
 
     elif self.long_control_state == LongCtrlState.starting:
