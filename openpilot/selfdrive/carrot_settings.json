@@ -326,6 +326,7 @@
               "zh": "停车与再起步",
               "params": [
                 "StopDistanceCarrot",
+                "StoppingAccel",
                 "VEgoStopping",
                 "AChangeCostStarting"
               ]
@@ -370,6 +371,7 @@
               "zh": "Carrot巡航",
               "params": [
                 "CruiseEcoControl",
+                "CruiseCoastingPercent",
                 "CarrotCruiseDecel",
                 "CarrotCruiseAtcDecel"
               ]
@@ -1035,6 +1037,23 @@
       "default": 2,
       "unit": 1,
       "display_unit": "speedKph"
+    },
+    {
+      "group": "크루즈",
+      "name": "CruiseCoastingPercent",
+      "title": "크루즈 코스팅 여유",
+      "descr": "0%는 기존 제어를 유지합니다. 설정속도 초과 구간에서 크루즈 감속만 완화하고, 여유 상한에 가까워지면 감속을 복원합니다. 설정속도를 높이거나 SCC를 끄지 않습니다. 앞차·정지·외부 속도제어가 없는 일반 크루즈에서만 적용됩니다.",
+      "egroup": "CRUISE",
+      "etitle": "Cruise Coasting Margin",
+      "edescr": "0% keeps existing control. Relaxes cruise braking above the set speed and restores it near the margin ceiling, without raising the set speed or disabling SCC. Applies only to ordinary cruise without leads, stopping, or external speed control.",
+      "cgroup": "巡航设置",
+      "ctitle": "巡航滑行余量",
+      "cdescr": "0%保持原有控制。在超过设定速度时减弱巡航减速，接近余量上限时恢复减速。不提高设定速度，也不关闭SCC。仅在无前车、停车或外部速度控制介入的普通巡航中生效。",
+      "min": 0,
+      "max": 10,
+      "default": 0,
+      "unit": 1,
+      "display_unit": "percent"
     },
     {
       "group": "크루즈",
@@ -3236,6 +3255,22 @@
       "default": 30,
       "unit": 10,
       "display_unit": "speedKph"
+    },
+    {
+      "group": "주행튜닝",
+      "name": "StoppingAccel",
+      "title": "정지시작가속도x0.01(-50)",
+      "descr": "정지 제어 진입 가속도와 정지 감속 목표를 조정합니다. -100~-50만 설정할 수 있으며 -50은 -0.50m/s²입니다. 더 음수일수록 감속 목표가 강해집니다. 이미 더 강한 감속은 유지하며, 소프트홀드는 차종별 정지 유지 가속도를 사용합니다. 변경은 주행 중에도 약 1초 안에 반영됩니다.",
+      "egroup": "LONG",
+      "etitle": "StoppingStartAccelx0.01(-50)",
+      "edescr": "Adjust the stop-entry acceleration threshold and stopping target. Only -100 to -50 is allowed; -50 means -0.50 m/s². More negative values request stronger deceleration. Existing stronger braking is retained, and soft hold uses the vehicle-specific hold acceleration. Changes apply within about one second, including while driving.",
+      "cgroup": "纵向控制",
+      "ctitle": "停止起步加速度 x0.01(-50)",
+      "cdescr": "调整停止控制的加速度进入阈值和减速目标。仅可设置-100至-50；-50代表-0.50m/s²。数值越负，减速目标越强。已有更强的制动请求保持不变，软保持使用车型的停车保持加速度。修改约一秒内生效，行驶中也适用。",
+      "min": -100,
+      "max": -50,
+      "default": -50,
+      "unit": 10
     },
     {
       "group": "가속설정",

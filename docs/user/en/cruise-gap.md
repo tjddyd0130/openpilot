@@ -115,32 +115,34 @@ Range 400–1000 cm, step 10 cm. The code divides by 100 and uses it as the fixe
 
 It is therefore not the actual moving following distance. Its direct effect is clearest near zero speed behind a stopped lead. When there is no active `leadOne` but the camera model consistently associates a stationary vehicle with the E2E stop endpoint, the planner first corrects that endpoint toward the inferred vehicle position and then applies this fixed clearance. No SCC/radar object is created. Although the catalog description says “stop position ×0.8,” the running code does not apply 0.8.
 
-### Fixed stopping acceleration
+### `StoppingAccel` · Stopping acceleration
 
-Stopping acceleration is fixed at `-0.50 m/s²` (formerly stored as `-50`) for all brands and is no longer adjustable in settings. Existing `StoppingAccel` values, including `0` and other negative values, are ignored.
+Default `-50`, range `-100 to -50`, step `10`. `-50` means `-0.50 m/s²`; `-100` means `-1.00 m/s²`. It is used across brands when openpilot controls longitudinal motion and does not directly control stock ACC longitudinal operation.
 
-This value sets the stop-entry acceleration threshold and the stopping acceleration target. On Hyundai/Kia CANFD with openpilot longitudinal control, stronger requests also gradually return to -0.50 m/s². Other existing control paths retain stronger requests and use the vehicle-specific stationary-hold acceleration for soft hold. This value does not directly control acceleration or braking when stock ACC is responsible.
+The original behavior enters stopping after `shouldStop` when actual acceleration exceeds the setting. Existing state-transition exceptions, including a nearby lead, remain. During stopping, requests weaker than the target become more negative at the vehicle's stopping rate; stronger requests are retained. Soft hold uses the vehicle-specific stationary-hold acceleration.
+
+- **Raise it (toward −50):** requests weaker deceleration and delays the ordinary acceleration-based handover to stopping.
+- **Lower it (toward −100):** requests stronger deceleration and advances that handover. It can increase stopping impact.
+
+Changes apply within about one second, including while driving. Stronger output already reached during a stop is retained, so selecting a weaker target does not immediately reduce braking. Control clamps old or directly written out-of-range values to the range endpoints; unreadable values use the default.
 
 <a id="canfd-stopping"></a>
 ### CANFD stopping and retry
 
-Runs by default on Hyundai/Kia CANFD with openpilot longitudinal control. There is no separate setting, and previously stored values of the removed `CanfdStopRetry` option are ignored. Conventional CAN vehicles and stock ACC longitudinal control are outside its scope.
+Retry runs by default on Hyundai/Kia CANFD with openpilot longitudinal control. There is no separate setting, and the removed `CanfdStopRetry` value is not read. Conventional CAN vehicles and stock ACC longitudinal control are outside its scope.
 
-- When StopReq becomes active, both aReqRaw and aReqValue start from the preceding aReqValue output and gradually approach -0.50 m/s². A -0.30 request becomes more negative; a -1.00 request becomes less negative. Positive starting requests are clamped to zero. InfoDisplay and byte7 are zero, and the lower band uses a fixed experimental value of 0.20 during stop requests without copying stock SCC values.
-- In normal ACC, decelerating below 0.7 m/s with a planned stop prepares stop intent up to one second earlier. Ordinary braking continues while actual acceleration is below -0.50 m/s²; stopping begins in the control cycle when it reaches -0.50 m/s² or above. Steady crawling and planned starts or reacceleration do not qualify. Blended-mode stop intent is unchanged.
-- An armed, stationary soft hold requests negative acceleration before the driver releases the brake. StopReq is asserted after two SCC frames with transmitted aReqValue at or below -0.50 m/s². Jerk limiting can extend preparation; releasing the pedal earlier continues the preparation phase.
-- If motion persists, releases StopReq, requests negative acceleration, then reasserts once. If the retry still fails, retains negative acceleration requests without repeated toggling. Accelerator input, cruise disengagement, and interlocks such as Auto Hold cancel it. Requests while the brake is pressed are allowed only for an armed soft hold with every speed input at or below 0.10 m/s.
-
-Convergence follows the vehicle's stopping rate and CAN jerk limits without passing the target. Reasserting StopReq also continues from the preceding output. Recovery with StopReq released requests the stronger deceleration of the existing request and -0.50 m/s².
+- Stop intent and acceleration use the original control path. The additional one-second stop preview, forced convergence to -0.50 m/s² after StopReq, and two-frame soft-hold preparation are removed.
+- While StopReq is active, aReqRaw follows control with `StoppingAccel`, and aReqValue uses normal packet limiting. InfoDisplay and byte7 remain zero; the lower band uses a fixed experimental value of 0.20 without copying stock SCC values.
+- At low speed, elapsed time or distance alone does not release StopReq while deceleration continues. Acceleration rising from negative toward zero alone does not trigger retry either. Retry requires a sustained speed rebound with positive acceleration, or sustained loss of deceleration with insufficient speed reduction.
+- Retry releases StopReq and requests the stronger deceleration of the existing request and -0.50 m/s², then reasserts once. Further failure retains negative acceleration requests without repeated toggling. This does not change the planner's departure decision or add reverse-direction detection.
+- Accelerator input, cruise disengagement, and interlocks such as Auto Hold cancel it. Requests while the brake is pressed are allowed only for an armed soft hold with every speed input at or below 0.10 m/s.
 
 > [!CAUTION]
-> Default operation does not establish complete stopping or collision prevention across vehicles. Vehicle response must be checked in a controlled area where you can brake directly.
+> Retry does not guarantee complete stopping or collision prevention across vehicles. Any reduction in stopping impact also requires vehicle validation.
 
 ### `VEgoStopping`
 
-Range 1–100, step 5. A value of 50 is 0.50 m/s (about 1.8 km/h). `shouldStop` becomes true when both the planner's current and one-second-ahead target speeds are below this threshold.
-
-In normal ACC on Hyundai/Kia CANFD with openpilot longitudinal control, an additional low-speed check anticipates a planned stop by up to one second. This earlier check uses the smaller of the setting and 0.05 m/s as its planned-speed threshold; it does not advance the acceleration plan itself.
+Range 1–100, step 5. A value of 50 is 0.50 m/s (about 1.8 km/h). `shouldStop` becomes true when both the planner's target speeds at the control-delay horizon and one second later are below this threshold.
 
 Lowering it delays stop recognition and may release stop state sooner on departure. Raising it enters stop state earlier but can make departure feel sluggish.
 
@@ -332,6 +334,22 @@ Lead response uses the final level after the mode cap. A selected 5 uses level 3
 Designed to encourage HEV EV-mode behavior, but the code has no vehicle-type restriction. When ego speed is more than 3 km/h below a set speed above 20 km/h, this value is temporarily added to the planner target. The correction ends after ego speed exceeds the original set speed.
 
 For set speed 100, ego 96, and a value of 2, the temporary target is 102 km/h. Range is 0–10 km/h; zero disables it. This changes the target, not the maximum acceleration, so driving mode and the acceleration table still matter.
+
+### Cruise coasting margin (`CruiseCoastingPercent`)
+
+Relaxes cruise braking that would bring a small overspeed back to the set speed. The default is **0%**, the range is **0–10%**, and the step is **1%**. **0% retains existing control.**
+
+- Does not raise the set speed or MPC target, disable SCC, or add positive acceleration commands.
+- For a 100km/h set speed and a 5% margin, braking relief applies between 100 and 105km/h. It does not accelerate the vehicle to 105km/h.
+- Relief eases in over the first 10% of the band; normal braking returns over the final 40%. In this example, relief increases from 100 to 100.5km/h and braking returns from 103 to 105km/h. The ceiling is a brake-restoration threshold, not a guaranteed maximum actual speed.
+- Applies only to ordinary cruise with openpilot longitudinal control, a reference above 10km/h, and the set speed, margin setting and eligibility unchanged for at least one second. The physical-speed reference is fixed using the conversion ratio at entry; later ratio changes neither restart the wait nor raise the reference.
+- Leads, cut-in candidates, stopping, curve acceleration limiting, ATC, lane changes, and Experimental Mode prevent relief. A changed set speed or margin, or loss of eligibility, requires a new reference and another one-second wait.
+- Navigation or other speed caps at or below the coasting ceiling prevent relief. External deceleration, pedal input, target changes, or invalid inputs give priority to normal control.
+- Does not apply while `CruiseEcoControl` raises the target or the existing CarrotCruise acceleration-limiting mode is active. This setting is separate from `CarrotCruiseDecel`.
+
+Adjust under Settings > Driving > Cruise & Gap > Carrot Cruise. Changes are read approximately once per second while running. Increase the margin to allow more overspeed before normal braking returns, or select 0% to restore existing control.
+
+A zero SCC acceleration request does not guarantee zero regeneration or braking. Actual regeneration and ride comfort depend on the vehicle; driving validation has not yet been completed.
 
 ### Conditions for `CarrotCruiseDecel` and `CarrotCruiseAtcDecel`
 

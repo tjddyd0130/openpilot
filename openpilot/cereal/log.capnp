@@ -159,6 +159,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     audio0 @114;
 
     torqueNNLoad @118;
+    updateRebootRequired @125;
 
     soundsUnavailableDEPRECATED @47;
   }
@@ -1242,6 +1243,9 @@ struct LongitudinalPlan @0xe00b5b3eba12876c {
   leadPreviewAccel @59 :Float32;  # deadbanded aLead - aEgo signal used by deceleration preview
   aChangeCost @60 :Float32;
   trafficStopModelLeadOffset @61 :Float32;  # 0 normally, +2 m for a confirmed model-vehicle stop
+  # Optional overspeed brake relief. Zero target/percent preserves legacy control.
+  cruiseCoastingTarget @62 :Float32;  # fixed physical m/s reference; 0 when ineligible
+  cruiseCoastingPercent @63 :UInt8;
 
   solverExecutionTime @35 :Float32;
 
@@ -2448,6 +2452,7 @@ struct UIDebug {
 
 struct ManagerState {
   processes @0 :List(ProcessState);
+  rebootRequired @1 :Bool; # checkout changed since manager startup
 
   struct ProcessState {
     name @0 :Text;
