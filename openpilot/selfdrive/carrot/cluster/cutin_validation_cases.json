@@ -2,6 +2,20 @@
   "sensitivity": 50,
   "cases": [
     {
+      "id": "carnival-1dc-19-stopping-path-endpoint-front-43",
+      "vehicle_folder": "KIA_CARNIVAL_4TH_GEN c4dcf95545dafe68",
+      "log": "000001dc--23e0551f1d--19/rlog.zst",
+      "source": "front+corner",
+      "window": [26.8, 28.2],
+      "expected": "detect",
+      "validation_stage": "lead_one",
+      "target_track_ids": [43],
+      "required_lead_one_ids": [43],
+      "latest_detection_s": 26.85,
+      "lead_one_continuous_window": [26.8, 28.2],
+      "scene": "Braking interruption on db4aed1e: measured front 43 and high-probability vision remain present, but the stopping model path ends about 11 m before the lead. A 3 cm terminal segment turns the forward separation into a false 10.93 m dPath. Recorded L1 disappears for 16 frames, replay 27.10-27.85 s, and acceleration requests weaken. Keep front 43 continuously selected through the short-path endpoint without enlarging selection gates. Video time is about 0.053 s after replay time; recorded radar publication time uses another origin. This is recorded-input lead-selection validation, not closed-loop braking validation."
+    },
+    {
       "id": "carnival-1c8-1-front-position-history-51",
       "vehicle_folder": "KIA_CARNIVAL_4TH_GEN c4dcf95545dafe68",
       "log": "000001c8--95bc7cab1c--1/rlog.zst",
@@ -2160,6 +2174,19 @@
       "target_track_ids": [1013],
       "latest_detection_s": 16.75,
       "scene": "Saved user review scene 09: the uphill white SUV at corner C1013 must be tracked by 16.75s. Camera frames were corrected using qRoadEncodeIdx timestamps. Front F40 has a different bearing and is not assigned as the same target. The requested radar lead deadline remains an open regression."
+    },
+    {
+      "id": "ev9-125-20-right-roadside-stationary-pair",
+      "vehicle_folder": "KIA_EV9 76665b7de33d4586",
+      "log": "00000125--53364ef9d7--20/rlog.zst",
+      "source": "front+corner",
+      "window": [12.0, 18.0],
+      "expected": "clear",
+      "human_verified": true,
+      "target_track_ids": [2302, 52],
+      "forbidden_lead_one_ids": [2302, 52],
+      "forbidden_lead_two_ids": [2302, 52],
+      "scene": "User-reported false braking near video 14.4s: right roadside returns stay outside the ego lane. Corner 2302 briefly jumps inward in position while reporting almost zero inward velocity; paired front 52 remains near-stationary and outside. The association must not corroborate lane entry or seed a retained L2 through the pass. Check CUT-IN, risk and both lead roles across the complete 12-18s window."
     },
     {
       "id": "santafe-92-69-bridge-joint-scc-backup-39",
