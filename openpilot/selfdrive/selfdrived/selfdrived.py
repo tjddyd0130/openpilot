@@ -79,6 +79,7 @@ class SelfdriveD:
     self.sensor_packets = ["accelerometer", "gyroscope"]
     self.use_wide_camera = bool(self.params.get("UseWideCamera", return_default=True))
     self.camera_packets = get_camera_packets(self.use_wide_camera)
+    self.disable_dm = self.params.get_int("DisableDM")  # tj: DisableDM kept
 
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
@@ -86,7 +87,7 @@ class SelfdriveD:
     ignore = self.sensor_packets + self.gps_packets + ['alertDebug']
     if SIMULATION:
       ignore += ['driverCameraState', 'managerState']
-    if self.CP.notCar or SIMULATION:
+    if self.CP.notCar or SIMULATION or self.disable_dm != 0:
       ignore += ['driverMonitoringState']
 
     if REPLAY:
@@ -248,7 +249,7 @@ class SelfdriveD:
       self.events.add(EventName.resumeBlocked)
 
     # Handle DM
-    if not self.CP.notCar:
+    if not self.CP.notCar and self.disable_dm == 0:
       if self.sm.all_checks(['driverMonitoringState']) and self.sm['driverMonitoringState'].cameraUnavailable:
         self.events.add(EventName.driverMonitorFallback)
       # Block engaging until ignition cycle after max number or time of distractions
@@ -400,6 +401,8 @@ class SelfdriveD:
       self.not_running_prev = not_running
     dm_fallback_processes = {'dmonitoringmodeld'} if (self.sm.all_checks(['driverMonitoringState']) and
                             self.sm['driverMonitoringState'].cameraUnavailable) else set()
+    if self.disable_dm != 0:
+      dm_fallback_processes |= {'dmonitoringmodeld', 'dmonitoringd'}
     if self.sm.recv_frame['managerState'] and (not_running - self.ignored_processes - dm_fallback_processes):
       self.events.add(EventName.processNotRunning)
     else:

@@ -75,7 +75,8 @@ def and_(*fns):
   return lambda *args: all(fn(*args) for fn in fns)
 
 def enable_dm(started, params, CP: car.CarParams) -> bool:
-  return started or params.get_bool("IsDriverViewEnabled")
+  # tj: DisableDM 1/2 keeps driver monitoring fully off (retired upstream, kept here).
+  return (started or params.get_bool("IsDriverViewEnabled")) and params.get_int("DisableDM") == 0
 
 #def enable_connect(started, params, CP: car.CarParams) -> bool:
 #  return params.get_int("EnableConnect") > 0

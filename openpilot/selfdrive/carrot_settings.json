@@ -425,6 +425,7 @@
           "en": "Driver Monitor",
           "zh": "驾驶员监控",
           "params": [
+            "DisableDM",
             "DriverMonitoringMode",
             "CarrotVisionEnabled",
             "MuteDoor",
@@ -1961,6 +1962,22 @@
       "unit": 1,
       "control": "toggle",
       "risk": "high"
+    },
+    {
+      "group": "시작",
+      "name": "DisableDM",
+      "title": "DisableDM",
+      "descr": "0: 운전자 감시 사용, 1 또는 2: 운전자 감시 완전 끄기(카메라 감시와 조작 감시 모두 실행 안 함). 재부팅 필요. 웹 도로 영상은 CarrotVisionEnabled로 따로 켭니다(기존 2는 최초 1회 자동 이관).",
+      "egroup": "START",
+      "etitle": "DisableDM",
+      "edescr": "0: driver monitoring on, 1 or 2: driver monitoring fully off (no camera or interaction monitoring). Reboot required. Web road video is enabled separately by CarrotVisionEnabled (old 2 migrates once).",
+      "cgroup": "启动设置",
+      "ctitle": "禁用驾驶员监控",
+      "cdescr": "0: 启用驾驶员监控, 1 或 2: 完全关闭驾驶员监控。需要重启。网页道路视频由 CarrotVisionEnabled 单独控制。",
+      "min": 0,
+      "max": 2,
+      "default": 0,
+      "unit": 1
     },
     {
       "group": "시작",
