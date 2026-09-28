@@ -13,10 +13,12 @@ import openpilot.system.sentry as sentry
 from openpilot.common.utils import atomic_write
 from openpilot.common.basedir import BASEDIR
 from openpilot.common.params import Params, ParamKeyFlag
+from openpilot.common.stopping_params import get_stopping_speed
 from openpilot.common.repo_update import release_boot_lock
 from openpilot.common.text_window import TextWindow
 from openpilot.system.hardware import HARDWARE
 from openpilot.system.manager.camera_config import configure_wide_camera
+from openpilot.selfdrive.monitoring.config import configure_monitoring
 from openpilot.system.manager.helpers import unblock_stdout, write_onroad_params, save_bootlog
 from openpilot.system.manager.process import ensure_running
 from openpilot.system.manager.process_config import managed_processes
@@ -79,12 +81,15 @@ def manager_init() -> UpdateStatus:
   if params.get_bool("RecordFrontLock"):
     params.put_bool("RecordFront", True)
 
+  configure_monitoring(params)
+
   # set unset params to their default value
   for k in params.all_keys():
     default_value = params.get_default_value(k)
     if default_value is not None and params.get(k) is None:
       params.put(k, default_value)
 
+  get_stopping_speed(params, blocking=True)
   configure_wide_camera(params)
 
   # Create folders needed for msgq
