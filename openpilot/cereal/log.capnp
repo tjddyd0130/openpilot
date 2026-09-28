@@ -162,7 +162,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
     updateRebootRequired @125;
     driverMonitorFallback @126;
 
-    radarDisableFailed @126;  # VW MEB DISABLE_RADAR: stock radar knockout failed
+    radarDisableFailed @127;  # VW MEB DISABLE_RADAR: stock radar knockout failed
 
     soundsUnavailableDEPRECATED @47;
   }
