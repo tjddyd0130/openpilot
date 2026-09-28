@@ -1,5 +1,69 @@
 # Repository memory
 
+- On 2026-09-28, the user revised DriverMonitoringMode after the initial DM2
+  implementation. Mode 0 keeps stock camera behavior, but unavailable-camera
+  interaction timing is now 15/30/45 seconds. Mode 1 uses the same interaction
+  timing, doubled only on a verified empty straight road. New moving traffic
+  removes the empty-road bonus for 20 seconds. Camera mode 1 uses 2x stock vision
+  timing, 4x on a verified empty road, and 20% head-pose tolerance relaxation.
+  The user explicitly selected a full interaction grace: fresh control/BT input
+  resets monitoring and defers camera warnings for 45/90 seconds before its
+  warning clock starts. This supersedes the earlier two-second credit and
+  protected-distraction debt restriction; detection thresholds remain unchanged,
+  but sleep/eye/phone warnings are also delayed. Confident forward attention for
+  two seconds resets the camera clock without renewing interaction grace.
+  Terminal alerts and lockout remain; no input or context change clears them.
+  Camera absence AND failure automatically use interaction monitoring, with
+  recovery preserving progress; do not add a manual camera-installation setting.
+  Stock policy/dmonitoringd files stay unchanged. DisableDM is migration-only;
+  CarrotVisionEnabled is independent. These are requested experimental timing
+  choices, not statutory limits or device/driving validation. See
+  docs/driver_monitoring_dm2.md and both localized DM guides.
+
+- On 2026-09-28, the user requested ordinary Git storage wherever possible to
+  eliminate this branch's Git LFS bandwidth dependency. All seven remaining
+  LFS pointers were converted to byte-identical Git blobs; bundled models and
+  the legacy updater are below GitHub's per-file limit. Do not reintroduce LFS
+  tracking or setup pulls. Existing NAS model delivery stays unchanged, and
+  historical refs are not rewritten. See docs/lfs_to_git_20260928.md.
+
+- On 2026-09-28, the user approved C3/C3X main UI onroad affinity cores0,1,2,3,6
+  with SCHED_OTHER/nice19, superseding core6-only for tici/tizi. C4/mici stays
+  core6. Apply to all UI threads; offroad returns to little cores, and onroad
+  C3 keeps nice19 during big-core unavailability. Cluster/core7, camera/control/
+  model/radar and IRQ policies are unchanged. Casper logs on a3278c04 measured
+  UI15.54/14.68Hz with camera20Hz and substantial UI runnable wait; this is
+  pre-change evidence, not validation of the new mask. Affinity does not pin
+  one whole frame or guarantee little-first placement. See docs/camera_core5_trial.md.
+
+- On 2026-09-28, the user requested a single Windows installation ZIP and a
+  minimal Korean guide: extract, run 01, run 02, insert the finished card.
+  Follow-up requires bilingual stage introductions, approximate durations,
+  exact response instructions and brief safety guidance; brevity must not
+  remove backup/write-in-progress cautions or Jetson shutdown and power
+  disconnection before card insertion. Label the link "설치파일 받기".
+  Present Korean first with English underneath on a separate, visually secondary
+  line. Use clear stage headings, spacing and a styled offline HTML guide; never
+  interleave Korean and English with slash-separated sentences.
+  Keep hashes, portable dependencies, USB-C patching and readback automatic;
+  do not restore manual Python/Etcher/hash/hotfix steps to the default guide.
+  The package prepares a patched file before writing, preserves the published
+  base image/runtime/model and confirms the selected USB card before erasing.
+  PC preparation and disk-guard tests do not establish physical-card writing
+  or first-boot validation. See docs/jetson_windows_installer_20260928.md.
+
+- On 2026-09-27, the user requested full integration of `carrot-jetlink` into
+  `carrot-wip` and Korean-first public installation/release instructions. The
+  complete Jetlink history through b9950442ca is merged; do not treat it as an
+  independently maintained vehicle feature branch or recreate older experiments.
+  Keep the existing internal model, AMD Cinque v3 selection, AGNOS and validity
+  policies unchanged. Jetson uses its separately pinned Cinque v2 contract and
+  signed f2b22dc host release; merging vehicle code does not promote a new host
+  runtime/model or justify another image rebuild. Public host sources remain in
+  ajouatom/carrot-jetson and images on NAS. PC offline SD patch first-boot and
+  integrated vehicle driving/C3 checks remain distinct from prior parked C4
+  trials. See docs/jetson_wip_integration_20260927.md and the linked Korean guide.
+
 - On 2026-09-24, the user requested AGNOS updates without per-update approval:
   automatically download/install, wait and retry transient network failures,
   then reboot and continue normal startup. Both startup UIs now start the

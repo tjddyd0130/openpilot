@@ -160,6 +160,7 @@ struct OnroadEvent @0xc4fa6047f024e718 {
 
     torqueNNLoad @118;
     updateRebootRequired @125;
+    driverMonitorFallback @126;
 
     radarDisableFailed @126;  # VW MEB DISABLE_RADAR: stock radar knockout failed
 
@@ -2231,6 +2232,15 @@ struct DriverMonitoringState {
   alert3Count @12 :Int8;
   noResponseCount @13 :Int8;
   noResponseForceDecel @14 :Bool;
+  cameraUnavailable @15 :Bool;
+  dm2Experimental @16 :Bool;
+  dm2StrictTimeRemaining @17 :Float32;
+  dm2WheelTimeoutFactor @18 :Float32 = 1;
+  dm2ForwardAttentionScore @19 :Float32;
+  dm2ForwardRecovery @20 :Bool;
+  dm2InteractionCredit @21 :Float32;
+  dm2VisionTimeoutFactor @22 :Float32 = 1;
+  dm2InteractionGraceRemaining @23 :Float32;
 
   alwaysOn @3 :Bool;
   alwaysOnLockout @4 :Bool;
