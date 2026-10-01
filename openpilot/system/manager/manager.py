@@ -153,6 +153,14 @@ def manager_cleanup() -> None:
 
   cloudlog.info("everything is dead")
 
+
+def clear_ignition_on_params(params: Params) -> None:
+  # dm2d can have a session-disable write queued in Params' async writer. Stop
+  # it first so an old-session write cannot land after the ignition reset.
+  managed_processes["dmonitoringd"].stop(block=True)
+  params.clear_all(ParamKeyFlag.CLEAR_ON_IGNITION_ON)
+
+
 def read_rss_kb(pid: int) -> int:
   try:
     with open(f"/proc/{pid}/status") as f:
@@ -205,7 +213,7 @@ def manager_thread(update_status: UpdateStatus) -> None:
 
     ignition = any(ps.ignitionLine or ps.ignitionCan for ps in sm['pandaStates'] if ps.pandaType != log.PandaState.PandaType.unknown)
     if ignition and not ignition_prev:
-      params.clear_all(ParamKeyFlag.CLEAR_ON_IGNITION_ON)
+      clear_ignition_on_params(params)
 
     # update onroad params, which drives pandad's safety setter thread
     if started != started_prev:
@@ -301,8 +309,9 @@ if __name__ == "__main__":
     # Show last 3 lines of traceback
     error = traceback.format_exc(-3)
     error = "Manager failed to start\n\n" + error
-    with TextWindow(error) as t:
-      t.wait_for_exit()
+    if os.getenv("CARROT_STARTUP_RECOVERY") != "1":
+      with TextWindow(error) as t:
+        t.wait_for_exit()
 
     raise
 
