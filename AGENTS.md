@@ -1,5 +1,228 @@
 # Repository memory
 
+- On 2026-10-01, Casper EV `00001e75--ace5ac2325--9` confirmed SCC-only mode 0
+  with every SCC lateral measurement zero. The user requested always using the
+  measured SCC object in SCC-only modes and ignoring unreliable SCC lateral
+  position. Modes 0/-1 now use SCC longitudinal range/speed directly, then the
+  existing probability-qualified vision lead without an extra dPath gate when
+  SCC is absent. All SCC matching excludes its lateral coordinate; it cannot
+  establish geometric path occupancy. Mode 2 retains low-speed longitudinal
+  vision matching and independently corroborated SCC L2; mode 1 excludes SCC
+  and mode 3 retains front-first/SCC fallback. Web replay restores the recorded
+  source policy instead of forcing mode 2. Original mode-0 replay loses L1 on
+  30/1,199 frames with SCC and strong vision; corrected replay loses none and
+  uses vision on all 45 SCC-absent frames. Replay is not vehicle-response
+  validation. See docs/scc_longitudinal_lead_20261001.md.
+
+- On 2026-09-30, the user approved the handover revision and then explicitly
+  selected torque-ceiling-only rapid recovery: keep target angles and existing
+  angle limits unchanged, raise the ceiling faster for small error and slower
+  for large error, with no angle-error entry gate. This supersedes the earlier
+  captured-angle/offset-blending design proposal below. Mode 1 combines effort
+  and error levels/trends with tolerance, paused increases and gradual error-only
+  withdrawal; strong renewed force still yields quickly. Modes 2/3 use limited
+  early capture then low-force confirmation and continuous error-dependent rise.
+  Active experimental transitions own the total ceiling, so legacy max() cannot
+  bypass their rate; preserve independent legacy history, mode 0 and live polling.
+  88 focused tests and 6,000-frame mode-0 CAN/angle equivalence pass. Recorded-input
+  schedules are not vehicle response or steering-feel validation. See
+  docs/steering_handover_20260930.md for constants, replay and limitations.
+
+- On 2026-09-30, the handover follow-up review uses both angle-error and driver-
+  effort trends for mode 1, with tolerance and paused/gradual withdrawal for
+  ambiguous error growth, retaining fast yield for strong renewed driver effort.
+  For rapid release, onset angle error is an initial transition condition, not
+  a delayed small-error permission gate. Offline prototypes avoid ff7's short
+  46-to-25 withdrawal and schedule earlier limited offers, but unchanged-input
+  replay cannot establish vehicle response. The existing max(legacy, extra)
+  ceiling defeats bounded recovery; any implementation must coordinate total
+  authority and reference transition while preserving mode 0 and actuator limits.
+  This review changes no production code. See
+  docs/steering_handover_ff6_ff7_20260930.md for evidence and unresolved cases.
+
+- On 2026-09-30, Ioniq 5 PE ff6 segments 2/3 and ff7 segment 1 on b8a8a532
+  confirmed live handover mode 2→3 but delayed recovery after torque release.
+  Low-force confirmation can let angle error exceed the two-degree fast-recovery
+  gate; other releases miss arming/deadline conditions. No rapid recovery is
+  reconstructed in these windows. Legacy repeated-override ramps reach three
+  seconds; ff7's last release waits 520 ms then ramps for three seconds. One
+  short convergence offer is withdrawn 46→25 in about 12 ms on error growth
+  despite decreasing force. This may explain a tactile discontinuity but is not
+  proof of the user's exact felt moment. Touch-release edges arrive later and
+  are not demonstrated to be a faster cue. No controller change was requested
+  or made during this analysis. See docs/steering_handover_ff6_ff7_20260930.md.
+
+- On 2026-09-30, the user requested original-RX-paced forwarding of Hyundai
+  CAN-FD CAMERA_SCC cluster 0x161/162/1e0/1ea/200 from bus2 to bus0. Consume
+  allowed host copies into independent latest-value caches; use each stock RX
+  counter and recompute CRC, including byte-2 8-bit COUNTER for 8-byte 0x200.
+  No independent send without RX. Missing/expired host (150 ms) returns stock;
+  invalid original frames pass unchanged and invalidate the cache. Preserve
+  allowlists, relay protection, non-camera paths and existing control FIFO/reuse.
+  Latest-value sampling supports differing rates but can coalesce transient
+  displays and delay changes until next RX; freshness bounds host arrival only.
+  348 tests, 36,120-frame replay, 285,594 unchanged control comparisons and
+  F4/H7 builds pass. Wire timing, vehicle warning resolution and display/chime
+  behavior remain unvalidated. Requires updated Panda firmware. See
+  docs/canfd_cluster_rx_forwarding.md.
+
+- On 2026-09-30, the user requested live SteerHandoverMode for Hyundai/Kia/Genesis
+  angle control: 0 preserves legacy/default, 1 offers bounded recovery using
+  continuous driver effort and angle-error trends, 2 confirms abrupt force release
+  before faster recovery, and 3 combines them with release priority and no summed
+  gains. Poll every 0.5 seconds; only actual mode changes reset experimental history.
+  Keep legacy recovery state independent, steeringPressed boolean, torque-control
+  vehicles, touch/DM and angle/CAN limits unchanged. Effort is unbounded above 2;
+  the offer ceiling 80 is not physical torque or a proven tactile notification.
+  Reversal, rising force, error and invalidity withdraw added authority. Mode 0
+  matches the prior controller in a 6,000-frame input replay; synthetic/CAN tests
+  do not establish closed-loop driving or driver consent. A prolonged zero crossing
+  remains ambiguous. See docs/steering_handover_20260930.md for tests and limits.
+
+- On 2026-09-29, the user selected IMU-based suspected-impact detection at 1.5g
+  horizontal acceleration, with a visible/audible warning, ten seconds to cancel
+  by touching anywhere, then OpenpilotEnabledToggle=false and manager DoReboot.
+  Compensate gravity and mounting angle using fresh valid pose/calibration;
+  require two fresh samples within 30ms. aEgo is supporting context only.
+  Unseen/frozen UI cancels the transition; preserve takeover alert precedence.
+  Block control including AlwaysLateral during reboot, preserve normal volume,
+  and use the existing bounded reboot sound helper. Saved OFF persists until
+  manually enabled; reboot interrupts recording. No incident file protection or
+  upload is implied. The 1.5g threshold, drop/rough-road rejection, physical
+  display/audio and actual vehicle reboot remain unvalidated. See
+  docs/impact_dashcam_20260929.md.
+
+- On 2026-09-29, the user expanded the Carrot Web auto-update reboot sound request
+  to ordinary reboots. Use the stdlib-parent common/reboot.py helper for hardware,
+  manager, main Web tools and startup recovery: existing prompt.wav once before
+  reboot, separate audio child, four-second timeout, saved volume/mute respected.
+  Audio failure must not block reboot. Keep update eligibility and recovery policy
+  unchanged. Raw OS/factory-reset/standalone-recovery-web commands are not hooked.
+  Desktop tests do not establish physical speaker/reboot behavior. See
+  docs/reboot_sound_20260929.md.
+
+- On 2026-09-29, the user requested one onroad readiness sound at the first
+  engageable state (no NO_ENTRY event), preferring an existing sound. Use
+  prompt.wav once after 0.5 seconds of initialized, non-passive, onroad, healthy
+  CAN/service readiness and after current alerts finish. systemReady is sound-only
+  and lowest priority; preserve warning precedence and normal user/ambient volume.
+  The latch lasts for selfdrived's onroad process lifetime. Desktop tests do not
+  establish vehicle speaker/timing validation. See docs/system_ready_sound_20260929.md.
+
+- On 2026-09-29, Ioniq 5 PE C4 ff1 segments 0/2 on 250f14ed showed startup
+  DM inference/model readiness delay and a separate Jetlink 97.28 ms roundtrip
+  causing one model input skip and transient downstream invalidity. Expected
+  process PIDs and all camera frame-ID sequences remain continuous; this is
+  not evidence of a process crash or sensor capture loss. The user requested
+  hiding an absent Jetson: a fresh waiting report is now quiet before modeld's
+  first report, with READY restored on healthy connection. Preserve fresh model
+  errors, active-session conflicts and stale-link errors. Physical display and
+  the underlying isolated latency remain unvalidated. See
+  docs/jetlink_ff1_investigation_20260929.md.
+
+- On 2026-09-29, after two GV70 camera-side warning recurrences with unknown
+  cause, the user authorized blocking the observed stock-cluster popup and
+  requested checking its sound. Scope suppression to GENESIS_GV70_1ST_GEN
+  camera-SCC, lateral-only control, HDA_InfoPUDis=3 with the observed camera
+  FCA_SYSWARN=1/VALUE63=15 signature and no decoded MDPS/SCC fault or separate
+  popup/sound request. Modify only the outgoing cluster copy; retain raw CAN,
+  camera state, actual control and other fault/hands-off alerts. Both logs have
+  HDA_LFA_WrnSnd=0 and openpilot alertSound=none; popup-associated chime is an
+  inference, not confirmed audio causality. Replay removes all four observed
+  popup frames; physical display/sound suppression remains unvalidated.
+  See docs/canfd_feedback_counters.md. This supersedes the earlier recommendation
+  to leave this popup unchanged pending root-cause diagnosis.
+
+- On 2026-09-29, the user clarified that DM's 20-second standard hold starts
+  only when surrounding moving traffic appears after an absence. Additional
+  vehicles during occupancy do not extend it. Camera monitoring during the hold
+  uses stock timing/detection/inputs, expires prior grace and suspends experimental
+  resets; camera-unavailable timing stays 15/30/45. Then experimental criteria
+  resume, but occupied surroundings cannot earn the empty-road bonus. Retain
+  accumulated warnings/lockout and the two-second observation dropout retention.
+  No forced warning for attentive drivers. See docs/dm_traffic_hold_20260929.md.
+
+- On 2026-09-29, the user approved the C4 DM inset immediately right of D:
+  84x84 at (382,144), leaving 10px before the right strip. VISION moves above it;
+  confidence-dot travel returns to full height. C3 placement is unchanged.
+  DM event stage1 is visual-only; stage2 (first audible) has final PCM gain
+  >=0.7, and stage3 (final) always uses 1.0 regardless of user/ambient volume.
+  Match event identity and sound together so navigation sharing the WAV retains
+  normal volume. Desktop PCM/UI tests and synthetic rendering do not establish
+  physical-device loudness or readability. See docs/dm_onroad_preview_20260928.md.
+
+- On 2026-09-28, the user requested live DriverMonitoringMode changes. Poll
+  typed Params every 0.5 seconds in the existing DM dispatcher; ignore the retired
+  CARROT_DM_MODE startup latch. Preserve elapsed awareness, calibration, traffic
+  hold, warning counts and lockout. A real mode change ends previous interaction
+  grace and the forward-attention streak; an unchanged read must preserve them.
+  Shorter budgets may immediately trigger warnings; toggling is never attention
+  or a lockout reset. See docs/driver_monitoring_dm2.md for desktop validation.
+
+- On 2026-09-28, the user superseded the Ioniq 5 PE-only touch restriction:
+  Hyundai/Kia/Genesis CAN-FD uses original ECAN STEER_TOUCH_2AF by received
+  profile, without a vehicle-name whitelist. Require the named DBC/address/size,
+  existing layout/checksum/status/counter and freshness checks. Discover late
+  arrivals with optional registration only after reception; do not add missing-
+  hardware CAN faults or populate/modify ADAS TX caches. Address 0x2AF alone
+  is insufficient. All 37 configured CAN-FD platforms pass synthetic parser
+  tests; physical evidence remains Ioniq 5 PE only. See docs/driver_monitoring_dm2.md.
+
+- On 2026-09-28, the user authorized clearing DM lockout after confirmed parking:
+  valid/fresh Park, raw zero speed, standstill and disengaged/inactive status for
+  one continuous second, in both modes with or without camera. Filtered speed
+  may have only <0.01 m/s settling residue. Speed-only or engage OFF/ON resets
+  are excluded. Keep stock policy.py unchanged; selfdrived persists fresh DM
+  lock/release transitions so a cleared saved flag cannot relock on DM restart.
+  Desktop tests do not validate actual parking. See docs/driver_monitoring_dm2.md.
+
+- On 2026-09-28, the user requested a manual DM switch triggered by three
+  distinct physical vehicle CANCEL presses,
+  each separated by a release, within three seconds. Held/repeated packets, BT
+  CANCEL and automatic-control CANCEL echoes do not count. Another received
+  non-CANCEL button event, invalid/stale state, input-stream gap or timeout resets
+  progress. On 2026-09-29, the user removed all gear and speed restrictions:
+  every gear and standstill are eligible, and gear or speed changes alone do not
+  reset progress. Ambiguous stock-ACC speed-button echoes conservatively reset
+  progress because they cannot be distinguished from a physical intervening
+  press. The
+  cancel-echo filter correlates carControl requests rather than confirmed CAN
+  transmission, so a physical CANCEL overlapping that 150 ms window may be
+  conservatively ignored and must be pressed again. Hyundai/Kia/Genesis
+  openpilot-long bypasses this filter because its controller does not transmit
+  CANCEL buttons from that path even though the internal request level can stay
+  high; stock-long and other platforms retain the filter. Its paired-release
+  suppression expires after 0.5 seconds; an interleaved physical press/release
+  can therefore require one additional press without causing a false disable.
+  The gesture turns DM off only for the current ignition session. The later
+  2026-09-29 revision also retains DriverMonitoringEnabled as a persistent,
+  default-on switch exposed only through Carrot Web search. It is intended for
+  absent or failed DM cameras; recommend leaving it on, and explain that turning
+  DM off may violate applicable laws or driving requirements without claiming
+  universal illegality. The next ignition-on or manager/device restart clears
+  only DriverMonitoringSessionDisabled; a saved Web OFF stays off until the
+  user manually enables DriverMonitoringEnabled again. File/QR backups and
+  file/QR/profile restore paths exclude DriverMonitoringEnabled, including
+  values in older backups; old backup downloads are filtered too. Resetting all
+  settings may restore the default ON value. Persistent OFF must be selected
+  locally on each device. Disabled DM
+  stops the model during normal onroad operation and gates alerts, monitoring
+  force deceleration and lockout while retaining a neutral state heartbeat.
+  Driver View may run the model only for face preview while enforcement remains
+  neutral. Keep DriverMonitoringMode and CarrotVisionEnabled independent;
+  DisableDM remains migration-only. Desktop tests do not establish vehicle
+  validation. See docs/driver_monitoring_dm2.md and both localized DM guides.
+
+- On 2026-09-28, the user authorized automatic Git update/reboot after failed
+  builds or manager startup, waiting through network loss. The launcher owns a
+  standalone recovery display and releases its build lock before recovery Git.
+  Retry after 30 seconds; automatic reboot requires a newly applied commit, so
+  the same broken revision cannot reboot-loop. Keep the manual Git pull/reboot
+  button, current branch/upstream, dirty-file protection and shared repo lock.
+  No hard reset, normal onroad update action or AGNOS-policy change is implied.
+  Graphics failure has a stdlib-only update fallback. Desktop tests/renders do
+  not validate physical C3/C4 touch or device reboot. See docs/startup_recovery.md.
+
 - On 2026-09-28, the user requested original Ioniq 5 PE wheel touch in DM,
   explicitly preserving existing ADAS transmission. ECAN 0x2AF raw bytes now
   feed separate CarState.steeringTouch; torque-based steeringPressed and TX

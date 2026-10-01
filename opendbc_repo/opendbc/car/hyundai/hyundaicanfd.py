@@ -337,7 +337,7 @@ def create_acc_cancel(packer, CP, CAN, cruise_info_copy):
   })
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values)
 
-def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
+def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active, *, suppress_camera_auto_disengage=False, dm_alert=0):
 
 
   if CS.lfahda_cluster is not None:
@@ -351,7 +351,39 @@ def create_lfahda_cluster(packer, CS, CAN, long_active, lat_active):
     values["HDA_OptUsmSta"] = 2
   values["HDA_CntrlModSta"] = 2 if long_active else 0
   values["HDA_LFA_SymSta"] = 2 if lat_active else 0
+  # GV70's blocked stock camera can request this popup during lateral-only
+  # control. Suppress only the observed signature in the outgoing cluster copy;
+  # retain raw camera evidence and all fault / hands-off popup identities.
+  lfa = CS.lfa if suppress_camera_auto_disengage else None
+  mdps = CS.mdps if suppress_camera_auto_disengage else None
+  scc = CS.scc_control if suppress_camera_auto_disengage else None
+  if (suppress_camera_auto_disengage and lat_active and not long_active
+      and values.get("HDA_InfoPUDis") == 3 and values.get("HDA_InfoPUDis1") == 0
+      and values.get("HDA_LFA_WrnSnd") == 0
+      and lfa is not None and lfa.get("FCA_SYSWARN") == 1 and lfa.get("VALUE63") == 15
+      and mdps is not None and mdps.get("LKA_FAULT") == 0 and mdps.get("LFA2_FAULT") == 0
+      and scc is not None and scc.get("SysFailState") == 0):
+    values["HDA_InfoPUDis"] = 0
+  if dm_alert in (1, 2, 3) and values.get("HDA_InfoPUDis") == 0 and values.get("HDA_InfoPUDis1") == 0:
+    values["HDA_InfoPUDis"] = 5  # DBC: hands-off popup, without the sound of value 6
   return [packer.make_can_msg("LFAHDA_CLUSTER", CAN.ECAN, values, rx_counter=rx_counter)]
+
+def _apply_driver_monitoring_alert(values, hud_control, stock):
+  level = getattr(hud_control, "driverMonitoringAlert", 0)
+  if level not in (1, 2, 3):
+    return
+  # Use the documented DAW/break reminder, escalating to takeover at terminal
+  # DM. Apply after the legacy stock-warning filter, on a fresh copy each tick.
+  # Do not replace another OEM popup or add a second, unsynchronised chime.
+  if values["DAW_ICON"] == 0:
+    values["DAW_ICON"] = 1
+  if stock["ALERTS_2"] in (7, 8, 9, 10, 14, 21):
+    values["ALERTS_2"] = stock["ALERTS_2"]
+    for i in range(1, 5):
+      values[f"SOUNDS_{i}"] = stock[f"SOUNDS_{i}"]
+  if values["ALERTS_2"] == 0:
+    values["ALERTS_2"] = 9 if level == 3 else 5
+
 
 def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
   ret = []
@@ -381,6 +413,7 @@ def create_lfa_icon_non_camera_scc(packer, CS, CAN, CC):
     if values["ALERTS_5"] in [1, 2, 3, 4, 5]:
       values["ALERTS_5"] = 0
 
+    _apply_driver_monitoring_alert(values, getattr(CC, "hudControl", None), CS.adrv_0x161)
     ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter=rx_counter))
   return ret
 
@@ -1028,6 +1061,7 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
         values["LANE_LEFT"] = 0 if trailer_lane_change_blocked else 1 if desire in (1, 3) else 0
         values["LANE_RIGHT"] = 0 if trailer_lane_change_blocked else 1 if desire in (2, 4) else 0
 
+        _apply_driver_monitoring_alert(values, hud_control, CS.adrv_0x161)
         ret.append(packer.make_can_msg("ADRV_0x161", CAN.ECAN, values, rx_counter = rx_counter))
 
       if CS.adrv_0x200 is not None:
