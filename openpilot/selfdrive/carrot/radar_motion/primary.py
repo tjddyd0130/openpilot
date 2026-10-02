@@ -14,6 +14,7 @@ from openpilot.selfdrive.carrot.radar_motion.predictor import (
   project_to_model_path,
   turning_corner_path_entry_allowed,
 )
+from openpilot.selfdrive.carrot.radar_motion.offpath_stationary import offpath_stationary_vision_mismatch
 
 
 RADAR_TO_CAMERA_M = 1.52
@@ -3753,6 +3754,13 @@ class VisionRadarMatcher:
       yaw_rate_rad_s,
       allowed_output_sources,
     )
+    if (
+      not self._stationary_corner_supported
+      and offpath_stationary_vision_mismatch(stationary, vision)
+    ):
+      # carrot-wip-tj: drop adjacent-lane stationary fronts (see offpath_stationary.py).
+      self._reset_stationary()
+      stationary = None
     moving = self._match_moving(vision, point_values, path)
     output_values = (
       stationary_values
