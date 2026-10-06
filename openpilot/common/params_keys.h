@@ -282,7 +282,6 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
 
     {"SteerActuatorDelay", {PERSISTENT, INT, "0"}},
     {"LatSmoothSec", {PERSISTENT, INT, "13"}},
-    {"SteerHandoverMode", {PERSISTENT, INT, "0"}},
     {"LatSuspendAngleDeg", {PERSISTENT, INT, "300"}},
     {"CruiseOnDist", {PERSISTENT, INT, "400"}},
 
@@ -313,6 +312,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SoftwareMenu", {PERSISTENT, INT, "1"}},
 
     {"HyundaiCameraSCC", {PERSISTENT, INT, "0"}},
+    {"HyundaiCanfdClusterDirectTx", {PERSISTENT, BOOL, "0"}},
     {"FingerPrints", {PERSISTENT | CLEAR_ON_MANAGER_START, STRING}},
     {"IsLdwsCar", {PERSISTENT, INT, "0"}},
     {"CanfdHDA2", {PERSISTENT, INT, "0"}},
