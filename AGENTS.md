@@ -1,5 +1,91 @@
 # Repository memory
 
+- On 2026-10-05, the user clarified that instructions such as "작업해" or
+  "진행해" include committing and pushing the completed task unless explicitly
+  instructed otherwise. Commit only the task's changes; preserve unrelated work.
+
+- On 2026-10-05, the user requested an offline clock floor after pull/reboot,
+  before building. AGNOS startup reads local HEAD's committer timestamp before
+  dependency/Params/main builds; only an earlier clock advances to commit+1s.
+  Log and verify correction; failures enter existing startup recovery. Preserve
+  later clocks, NTP/GPS, file mtimes, caches and Cython/SCons behavior. 26 focused
+  desktop tests pass; device clock setting and native builds remain unvalidated.
+  This does not establish the cause or cure of intermittent native build errors.
+  See docs/build_time_floor_20261005.md.
+
+- On 2026-10-05, the user approved a distance range for holding extra following
+  headroom. Define D as ego speed times base TF plus configured stop distance,
+  excluding extra TF. Preserve existing hold at <=1.2D; smoothly reduce its
+  envelope/rise rate and restore recovery strength through 1.2-1.5D; at >=1.5D
+  recover at the existing level rate even for a stopped/opening lead. Use the
+  same rule in live state and MPC prediction. Preserve new-lead entry, level-5
+  bypass, physical obstacles, base TF, stopping logic/limits and the J20 trial.
+  299 focused tests pass; recorded-input reference replay reduces one approach's
+  extra margin from 1.916 to 0.142 m, not a vehicle stopping-time/clearance result.
+  Closed-loop comfort and clearance remain unvalidated. Keep incident data local.
+  See docs/longitudinal_gap_hold_band_20261005.md.
+
+- On 2026-10-03, the user requested a manual compatibility option for intermittent
+  cluster warnings: HyundaiCanfdClusterDirectTx defaults OFF on every vehicle,
+  including EV6. In CAN-FD CAMERA_SCC only, enabling it at startup selects the
+  legacy direct host-TX path for 0x161/162/1e0/1ea/200 via Hyundai flag bit 27
+  and Panda safetyParam 2048. Preserve other control FIFOs/reuse, allowlists,
+  relay protection and the default RX-paced path. This explicitly permits
+  independent cluster TX only when selected; no automatic RX timeout fallback,
+  vehicle-specific default or live switching. Reboot and updated Panda firmware
+  are required. 543 focused/settings/Wiki/firmware-identity tests and F4/H7
+  builds pass; actual warning resolution and physical timing remain unvalidated.
+  See docs/canfd_cluster_rx_forwarding.md. Keep incident data local.
+
+- On 2026-10-03, the user explicitly approved adding core7 to C3/C3X main UI
+  onroad affinity: cores0,1,2,3,6,7 with SCHED_OTHER/nice19 for all UI threads.
+  This supersedes the earlier core7 exclusion for this UI. C4 stays core6;
+  offroad returns to cores0..3. Check each big core independently; preserve
+  model/DM, control/camera, IRQ and USB cluster policies. An allowed mask is
+  not a CPU quota or parallel rendering and may concentrate UI work on core7.
+  Device affinity/FPS and model/DM impact remain unvalidated. See
+  docs/camera_core5_trial.md.
+
+- On 2026-10-03, Tucson `0000030c--adf522a321--4` showed unnecessary left
+  steering while passing a transporter. Actual speed stayed near 104 km/h
+  while the model velocity trajectory fell to about 36 km/h; lane MPC remained
+  active because the old end/start 70% test missed whole-trajectory collapse.
+  The user requested diagnosis through correction. LaneModelSpeedGuard now
+  also requires model starting speed >=70% of measured speed, retaining the
+  original future-deceleration gate and continuous one-second reacquisition.
+  Preserve model paths/speeds, MPC tuning, actuator limits and angle handover.
+  26 focused tests pass; same-input target replay reduces initial left peak
+  about 79% with fallback around 6.33 s. Small-angle MPC reconstruction matches
+  logged mode decisions and incident curvature closely; this is not native
+  acados or vehicle-response validation. Shadow versus transporter influence
+  on the original model output remains unresolved. See
+  docs/tucson_30c_left_steering_20261003.md.
+
+- On 2026-10-03, the user selected existing combined handover mode 3 as
+  standard for Hyundai/Kia/Genesis angle control and removed the selector.
+  CarController always uses mode 3 inside ANGLE_CONTROL; SteerHandoverMode
+  registration, catalog/menu and runtime reads are removed. Saved values no
+  longer affect behavior. Preserve the combined algorithm, thresholds, targets,
+  angle/CAN limits, torque-control paths and touch/DM. Internal helper variants
+  remain for comparisons; diagnostics still identify mode 3. 83 steering tests,
+  45 settings tests, 25 Wiki tests and 6,000-frame old-mode-3/new CAN equality
+  pass on desktop with Windows Params storage substituted. This promotion is
+  not a new retry fix or vehicle-response validation. See
+  docs/steering_handover_20260930.md.
+
+- On 2026-10-02, after the native CPU experiment and Ioniq 5 PE before/after
+  logs, the user explicitly approved promotion to `carrot-wip` and deletion of
+  the remote `carrot-native-cpu` branch. Keep the tested Cython radar statistics/
+  path projection and CAN extraction/packing kernels, Python comparison/fallback,
+  strict floating-point build flags and backend timing diagnostics. Preserve
+  radar algorithms, history, thresholds, validity, counters and CPU placement.
+  The discussed trajectory prefilter is deferred and must not be included.
+  Ioniq 5 logs confirm native activation and core5 mean 77.7 -> 70.9%, but input
+  workload differs; same-input replay matches all 2,400 radar frames with 30-31%
+  lower PC compute time. EV9 overloaded mode-3 native vehicle behavior is still
+  unvalidated. Maintain native x86/ARM CI and the shared NAS replay build.
+  See docs/native_cpu_experiment_20261002.md.
+
 - On 2026-10-01, Casper EV `00001e75--ace5ac2325--9` confirmed SCC-only mode 0
   with every SCC lateral measurement zero. The user requested always using the
   measured SCC object in SCC-only modes and ignoring unreliable SCC lateral

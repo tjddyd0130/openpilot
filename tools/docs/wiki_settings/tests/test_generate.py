@@ -86,7 +86,7 @@ class WikiSettingsGeneratorTest(unittest.TestCase):
       generated_at=STAMP,
     )
     self.assertEqual(len(result.generated_settings), 187)
-    self.assertIn("SteerHandoverMode", result.index["settings"])
+    self.assertNotIn("SteerHandoverMode", result.index["settings"])
     self.assertIn("CruiseCoastingPercent", result.index["settings"])
     self.assertIn("RadarTrackFlip", result.index["settings"])
     self.assertIn("DriverMonitoringEnabled", result.index["settings"])

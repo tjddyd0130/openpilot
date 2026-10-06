@@ -21,7 +21,7 @@ def source(packer, name):
 
 
 @pytest.mark.parametrize('camera_scc', [False, True])
-@pytest.mark.parametrize('stock_alert', [0, 1, 5, 7, 8, 9, 10, 12, 14, 21])
+@pytest.mark.parametrize('stock_alert', [0, 1, 2, 5, 7, 8, 9, 10, 12, 14, 21])
 def test_fd_warning_transitions_preserve_raw_stock_and_integrity(monkeypatch, camera_scc, stock_alert):
   monkeypatch.setattr(hyundaicanfd, 'Params', lambda: NS(get_int=lambda key: 0, get=lambda key: '0'))
   packer = CANPacker('hyundai_canfd_generated')
@@ -46,12 +46,20 @@ def test_fd_warning_transitions_preserve_raw_stock_and_integrity(monkeypatch, ca
     baseline = 0 if stock_alert in (1, 2, 5, 6, 10, 21, 22) else stock_alert
     expected = baseline
     if level:
-      expected = stock_alert if stock_alert in (7, 8, 9, 10, 14, 21) else baseline or (9 if level == 3 else 5)
+      expected = stock_alert if stock_alert in (7, 8, 9, 10, 14, 21) else baseline or (2 if level == 3 else 1)
     assert values['ALERTS_2'] == expected
-    assert values['DAW_ICON'] == int(level > 0)
+    assert values['DAW_ICON'] == 0
+    dm_popup = level and not baseline and stock_alert not in (10, 21)
+    if dm_popup:
+      label = CANDefine('hyundai_canfd_generated').dv['ADRV_0x161']['ALERTS_2'][values['ALERTS_2']]
+      assert label == ('KEEP_HANDS_ON_STEERING_WHEEL_RED' if level == 3 else 'KEEP_HANDS_ON_STEERING_WHEEL')
     assert values['COUNTER'] == (255 + i) % 256
     assert values['CHECKSUM'] == hyundaicanfd.hkg_can_fd_checksum(msg[0], None, bytearray(msg[1]))
-    assert all(values[f'SOUNDS_{n}'] == 0 for n in range(1, 5))
+    chime = 3 if dm_popup and level == 3 else 0
+    assert values['SOUNDS_2'] == chime
+    assert all(values[f'SOUNDS_{n}'] == 0 for n in (1, 3, 4))
+    if chime:
+      assert CANDefine('hyundai_canfd_generated').dv['ADRV_0x161']['SOUNDS_2'][chime] == 'CONSTANT_CHIME'
     assert stock == original
 
 
@@ -117,12 +125,27 @@ def test_fd_fallback_retains_existing_popups(popup, secondary):
     assert stock == original
 
 
-def test_dm_never_clears_stock_emergency_sound():
+@pytest.mark.parametrize('level', [1, 2, 3])
+def test_dm_never_clears_stock_emergency_sound(level):
   packer = CANPacker('hyundai_canfd_generated')
   stock = source(packer, 'ADRV_0x161') | {'ALERTS_2': 21, 'SOUNDS_1': 6, 'SOUNDS_2': 3, 'SOUNDS_3': 5, 'SOUNDS_4': 2}
   cs = NS(adrv_0x161=stock, out=structs.CarState())
   cc = structs.CarControl()
-  cc.hudControl.driverMonitoringAlert = 1
+  cc.hudControl.driverMonitoringAlert = level
   values = decode(packer, hyundaicanfd.create_lfa_icon_non_camera_scc(packer, cs, NS(ECAN=0), cc)[0])
   assert values['ALERTS_2'] == 21
   assert all(values[f'SOUNDS_{i}'] == stock[f'SOUNDS_{i}'] for i in range(1, 5))
+
+
+@pytest.mark.parametrize('channel,sound', [(1, 6), (2, 2), (3, 5), (4, 2)])
+def test_terminal_dm_does_not_add_chime_over_another_stock_sound(channel, sound):
+  packer = CANPacker('hyundai_canfd_generated')
+  stock = source(packer, 'ADRV_0x161') | {'ALERTS_1': 1, 'ALERTS_3': 1, f'SOUNDS_{channel}': sound}
+  original = stock.copy()
+  cs = NS(adrv_0x161=stock, out=structs.CarState())
+  cc = structs.CarControl()
+  cc.hudControl.driverMonitoringAlert = 3
+  values = decode(packer, hyundaicanfd.create_lfa_icon_non_camera_scc(packer, cs, NS(ECAN=0), cc)[0])
+  assert values['ALERTS_2'] == 2
+  assert all(values[f'SOUNDS_{i}'] == stock[f'SOUNDS_{i}'] for i in range(1, 5))
+  assert stock == original

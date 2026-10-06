@@ -109,14 +109,14 @@ The current `carrot_settings.json` contains **187 parameters**. One driver-monit
 
 | Category | Count | Groups |
 |---|---:|---|
-| Driving control | 124 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
-| Vehicle and hardware | 16 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
+| Driving control | 123 | Startup and auto, buttons and presets, steering, speed and deceleration, cruise and following gap |
+| Vehicle and hardware | 17 | Hyundai/Kia, CAN FD/HDA, radar, driver monitoring, vehicle assistance, device hardware |
 | Display | 34 | Information, path, brightness/on-road view, external HUD |
 | System | 12 | Recording/power, network/map, sound, software |
 
 ## Driving control
 
-These 124 settings can affect vehicle motion. Change one item at a time.
+These 123 settings can affect vehicle motion. Change one item at a time.
 
 <a id="start-auto"></a>
 ### Startup and auto — 9 settings
@@ -147,19 +147,21 @@ The result depends heavily on whether the car uses stock SCC and which button me
 Volkswagen's separate `SET` button sets current speed and `RES` restores the previous set speed, while `+`/`-` follow the button mode, speed units, and long-press setting. Manual engagement with openpilot longitudinal control remains tied to the physical `SET`/`RES` buttons.
 
 <a id="vehicle-steering"></a>
-### Vehicle steering — 38 top-level + 5 ONNX detail settings
+### Vehicle steering — 37 top-level + 5 ONNX detail settings
 
 | Section | Parameters | Purpose |
 |---|---|---|
 | ONNX Lane and BSD | `ShareData`, `OnnxLaneThreshold`, `OnnxLaneIntervalMs`, `OnnxBsdThreshold`, `OnnxBsdSmoothingMs`, `OnnxBsdIntervalMs` | On-device lane-type and gated camera-BSD detection and tuning |
 | Centering | `PathOffset`, `CameraYawTrimDeg` | Path position and camera-yaw trim |
-| Steering feel | `SteerActuatorDelay`, `LatSmoothSec`, `SteerHandoverMode`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | Timing, smoothing, handover recovery, suspension angle, and steering ratio |
+| Steering feel | `SteerActuatorDelay`, `LatSmoothSec`, `LatSuspendAngleDeg`, `CustomSR`, `SteerRatioRate` | Timing, smoothing, suspension angle, and steering ratio |
 | [Lane change](lane-change.md) and automatic turn | `LaneChangeNeedTorque`, `LaneChangeDelay`, `LaneChangeBsd`, `LaneLineCheck`, `AutoTurnControl`, `AutoTurnControlSpeedTurn`, `AutoTurnControlTurnEnd`, `AutoTurnMapChange` | Lane-change entry conditions and ATC behavior |
 | Lane mode | `LatMpcPathCost`, `LatMpcMotionCost`, `LatMpcAccelCost`, `LatMpcJerkCost`, `LatMpcSteeringRateCost`, `LatMpcInputOffset`, `UseLaneLineSpeed`, `UseLaneLineCurveSpeed`, `AdjustLaneOffset` | Lane-mode MPC weights and lane-line conditions |
 | Advanced torque | `LateralTorqueCustom`, `LateralTorqueAccelFactor`, `LateralTorqueFriction`, `LateralTorqueKpV`, `LateralTorqueKiV`, `LateralTorqueKf`, `LateralTorqueKd` | Custom torque-control gains |
 | Steering limits | `CustomSteerMax`, `CustomSteerDeltaUp`, `CustomSteerDeltaDown`, `CustomSteerDeltaUpLC`, `CustomSteerDeltaDownLC` | Maximum torque and torque-rate limits |
 
 `ONNX Lane and BSD Detection` (`ShareData`) runs solid/dashed classification and gated camera BSD on the device. Its detail screen keeps the feature toggle at the top and shows the BSD detection-area editor in a separate card directly below it, with only side selection, image refresh, point undo/reset, and area save in the primary view. The basic rectangular point picker at the image's upper left uses `1(L)` and `1(R)` labels; tapping empty space adds a point whenever none is selected. Zoom, viewport panning, and whole-area dragging are omitted so only the selected point moves. Two equal-width buttons directly below the four editing actions open the road- and wide-camera images in pop-up dialogs. Runtime state, confidence, performance, diagnostics, and five persistent tuning values open from the lower-right **Expand/Collapse advanced settings** text and are collapsed by default. The editor retains one last camera frame and shows a dim default road example when no frame is available. An area can be saved only after receiving a real camera image in the current session. It defaults to off, and saved tuning values survive a service restart. The update includes OpenCV, prepared automatically during normal startup. See [conditions and detailed values](lane-change.md#sharedata--onnx-lane-and-bsd-detection).
+
+Even when lane mode is enabled through `UseLaneLineSpeed`, control temporarily switches to laneless if the model speed trajectory starts below 70% of measured vehicle speed or ends below 70% of its starting speed. Lane mode can resume after approximately one continuous second of acceptable speeds, provided the existing lane and speed conditions also pass.
 
 A larger `SteerActuatorDelay` compensates by commanding earlier. A larger `LatSmoothSec` is smoother but may respond more slowly. Changing both together makes diagnosis difficult.
 
@@ -171,24 +173,15 @@ Previously ignored ID.4 values now take effect. For example, with `CustomSR=0`, 
 
 `LateralTorqueCustom` and `CustomSteer*` are advanced settings that can affect the vehicle tune and safety limits. Do not alter them without a vehicle-specific validated baseline and a recovery path.
 
-#### Steering Handover Mode — SteerHandoverMode
+#### Steering recovery after driver intervention
 
-Choose this in Carrot Web **Driving → Steering → Steering Feel → Steering Handover Mode (Test)**. It applies only to Hyundai/Kia/Genesis angle-control vehicles; torque-control vehicles are unaffected.
+Hyundai/Kia/Genesis angle-control vehicles use the former combined mode 3 as standard. The mode selector has been removed, and previously saved mode values are ignored. Torque-control vehicles are unaffected.
 
-| Value | Method | Behavior |
-|---|---|---|
-| **0 (default)** | Existing recovery | Retains existing driver-override and recovery behavior. |
-| 1 | Convergence recovery | Combines steering-error and driver-force levels and trends for limited recovery. Small error fluctuations are tolerated; unclear convergence pauses the increase or gently reduces it. |
-| 2 | Abrupt-release recovery | A rapid force decline after sustained override starts limited recovery. Once low force is confirmed, smaller steering error permits faster torque-ceiling recovery and larger error slows it. |
-| 3 | Combined 1+2 | Prioritizes mode 2 when abrupt release is confirmed during mode 1. The increases are never added together. |
+- Steering-error and driver-force levels and trends permit limited recovery as they converge. Unclear convergence pauses the increase or gently reduces it.
+- A rapid force decline after sustained intervention takes priority. Once low force is confirmed, smaller error permits faster torque-ceiling recovery and larger error slows it. The two recovery increases are never added together.
+- Strong renewed intervention yields quickly. Target steering angles and existing angle limits remain unchanged.
 
-**Changes apply live at roughly half-second intervals without rebooting.** An actual mode change clears experimental evidence while preserving the legacy recovery history. Re-reading the same value does not reset anything. Returning to 0 ends additional recovery and uses the existing behavior. Operate the setting while parked.
-
-Mode 1 briefly offers limited authority while waiting for driver force to decrease. Stronger force lowers the ceiling; clear opposing or increasing force yields quickly. Error growth alone does not abruptly cancel the offer, and no response withdraws it gradually. After rejection, it does not repeat until force release is confirmed. The offer ceiling of `80` is neither a physical torque unit nor a guaranteed tactile cue.
-
-Mode 2 does not block recovery solely for large steering error or jump directly to maximum authority. Current error adjusts the rise rate throughout recovery, and renewed intervention yields quickly. Every mode preserves the target angle and existing angle limits. During experimental recovery, a higher legacy ceiling cannot bypass the selected rise rate.
-
-This feature uses force-sensor trends and cannot establish loss of hand contact or driver consent to handover. Existing `steeringPressed` and driver monitoring remain unchanged. Modes 1, 2 and 3 have not been validated for vehicle steering feel; compare them only in controlled tests.
+Force-sensor trends do not establish loss of hand contact or driver consent to handover. Existing `steeringPressed` and driver monitoring remain unchanged. Making this behavior standard does not establish the same steering feel on every vehicle.
 
 ### Speed and deceleration — 23 settings
 
@@ -230,7 +223,7 @@ Eco caps lead response at 2 and Safe at 3; Normal and High retain the selected v
 
 `TFollowGap1` through `TFollowGap4` are stored in hundredths of a second. Lower values reduce the time gap. Use `LeadAccelResponse` for acceleration response: levels 1–3 are gradual, 4 is quick, and 5 retains maximum response. Added deceleration margin does not accumulate.
 
-`LeadAccelResponse`: Adjusts how the car follows a lead vehicle as it starts or speeds up. Lower levels close the gap more gradually; higher levels follow more quickly. Level 0 turns off the acceleration boost, and level 5 is the most responsive test setting. See [Following responsiveness](cruise-gap.md#lead-response) for details.
+`LeadAccelResponse`: Adjusts how the car follows a lead vehicle as it starts or speeds up. Lower levels close the gap more gradually; higher levels follow more quickly. Level 0 turns off the acceleration boost, and level 5 is the most responsive test setting. See [Following responsiveness](cruise-gap.md#lead-response) for details. Extra-headroom hold conditions apply up to 1.2 times TF distance (speed × TF + stopping distance), ease progressively from 1.2 to 1.5 times, and no longer pause recovery at or above 1.5 times regardless of lead speed.
 
 `SpeedTFFactor` applies a linear speed multiplier to the selected base TF: 10 is unchanged; 20 doubles it at 100 km/h. `LeadAccelResponseTF1`–`TF4` use the common response at -1 and a gap-specific response at 0–5. Levels 4–5 retain speed TF. The driving-screen bar shows the dynamically adjusted following target in metres.
 
@@ -255,7 +248,7 @@ These settings describe the car, harness, and device hardware configuration. Do 
 | Group | Parameters | Purpose |
 |---|---|---|
 | Hyundai/Kia | `HyundaiCameraSCC`, `IsLdwsCar`, `HapticFeedbackWhenSpeedCamera` | SCC connection, LDWS behavior, and speed-event haptics |
-| CAN FD/HDA | `CanfdHDA2`, `CanfdDebug`, `HDPuse` | HDA2 selection, CAN FD diagnostics, and HDP |
+| CAN FD/HDA | `CanfdHDA2`, `HyundaiCanfdClusterDirectTx`, `CanfdDebug`, `HDPuse` | HDA2 selection, cluster direct send, CAN FD diagnostics, and HDP |
 | Radar | `EnableRadarTracks`, `RadarTrackFlip`, `EnableCornerRadar`, `CarrotRadarMode`, `CarrotRadarCutInSensitivity` | SCC radar, front-track orientation, corner radar, and Carrot Radar processing and cut-in sensitivity |
 | Driver monitoring | `DriverMonitoringEnabled` (search only), `DriverMonitoringMode`, `CarrotVisionEnabled`, `MuteDoor`, `MuteSeatbelt` | Driver monitoring and selected vehicle alerts |
 | Vehicle assistance | `MaxAngleFrames`, `SpeedFromPCM` | Steering-angle frames and stock-SCC speed control |
@@ -271,6 +264,8 @@ Regardless of gear or speed, including at standstill, three distinct physical CA
 `DriverMonitoringMode` applies while driver monitoring is on. It defaults to 0: stock comma camera monitoring criteria, or 15/30/45-second interaction monitoring when the camera is absent or failed. Mode 1 is for controlled experiments, with empty-road timing extensions and an interaction grace before camera warnings. A shared exception resets the usage restriction after one continuous second of valid Park, standstill and disengaged status. Mode changes apply live at roughly half-second intervals without rebooting. Switching preserves accumulated monitoring time, warning counts and lockout, and ends the previous interaction grace and forward-attention streak. See [driver monitoring and experimental-use conditions](driver-monitoring.md). `CarrotVisionEnabled` controls web road video independently. `DisableDM` remains migration-only; only its old value 2 video function is migrated once to `CarrotVisionEnabled`. Validated original `STEER_TOUCH_2AF` input on Hyundai/Kia/Genesis CAN-FD is supported without a vehicle-name whitelist, with held-contact and new-contact behavior depending on camera availability and mode.
 
 See [Radar tracks and corner radar](radar.md) before changing radar modes.
+
+**Cluster CAN Direct Send** (`HyundaiCanfdClusterDirectTx`) compares the original direct-send method on Hyundai/Kia/Genesis CAN-FD CameraSCC vehicles with intermittent cluster warnings. It defaults to OFF for every vehicle; enable it manually on an affected vehicle. Reboot the device after changing it. Updated Panda firmware supporting this setting is required. Resolution of vehicle warnings has not been validated.
 
 With `HyundaiCameraSCC=0` and no camera-SCC configuration already applied to the vehicle, receiving `SCC_CONTROL` (CAN-FD) or `SCC12` (classic CAN) on the camera bus during the current onroad session adds **Enable CameraSCC** to the CAN error alert. This is bus2, or the corresponding camera bus with multiple Pandas. The hint uses reception history and does not establish the cause of every CAN error. It never changes the setting automatically; existing disengagement and engagement blocking remain active. Select the mode appropriate for the vehicle and wiring while stopped, then verify it in the next onroad session.
 
@@ -292,6 +287,12 @@ In modes `EnableRadarTracks=1`–`3`, a confirmed departing front lead can recei
 ## Display
 
 Display contains 34 settings. External-HUD settings control the layout and output of separate display hardware.
+
+`ClusterHud` (External HUD Display) switches a **HUD connected directly to the device USB port** on or off. A HUD connected to Jetson starts automatically even when this value is `0`, and normally turns its display off with ignition. Use the existing always-on `ClusterHudDebug` modes to keep it visible offroad. Brightness and layout settings also apply to the Jetson HUD.
+
+The Jetson HUD shows the highest internal sensor temperature below `jetSON`, or in the upper-right corner in full-screen navigation/graph modes. If temperature data has not refreshed for three seconds, it shows `--°C`. A top-strip temperature warning starts 5°C below each sensor's configured thermal limit; reaching that limit shows an overheating warning. For example, a device configured to throttle at 99°C warns from 94°C. Check the fan and ventilation when warned. Vehicle driving alerts take precedence, and Jetson temperature remains separate from device temperature/memory statistics. This feature requires updated Jetson HUD software.
+
+With `CarrotVisionEnabled` on, the external HUD and web camera view can be used together. Simultaneous video use may increase device load. See the [Carrot Web guide](carrot-web.md).
 
 | Group | Parameters | Purpose |
 |---|---|---|
