@@ -202,7 +202,7 @@ struct CarState {
   espDisabled @32 :Bool;
   accFaulted @42 :Bool;
   carFaultedNonCritical @47 :Bool;  # some ECU is faulted, but car remains controllable
-  radarDisableFailed @95 :Bool;     # VW DISABLE_RADAR: radar knockout at init failed (long will fault)
+  radarDisableFailed @100 :Bool;     # VW DISABLE_RADAR: radar knockout at init failed (long will fault)
   espActive @51 :Bool;
   vehicleSensorsInvalid @52 :Bool;  # invalid steering angle readings, etc.
   lowSpeedAlert @56 :Bool;  # lost steering control due to a dynamic min steering speed
@@ -230,6 +230,11 @@ struct CarState {
   # blindspot sensors
   leftBlindspot @33 :Bool; # Is there something blocking the left lane change
   rightBlindspot @34 :Bool; # Is there something blocking the right lane change
+  leftBlindspotOem @95 :Bool; # vehicle BSD-only left source before ONNX merge
+  rightBlindspotOem @96 :Bool; # vehicle BSD-only right source before ONNX merge
+  leftBlindspotOnnx @97 :Bool; # ONNX BSD-only left source
+  rightBlindspotOnnx @98 :Bool; # ONNX BSD-only right source
+  blindspotSplitSourcesValid @99 :Bool; # split blindspot source fields are valid and should be trusted
 
   fuelGauge @41 :Float32; # battery or fuel tank level from 0.0 to 1.0
   charging @43 :Bool;
