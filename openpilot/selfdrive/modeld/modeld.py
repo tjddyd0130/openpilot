@@ -18,7 +18,8 @@ from openpilot.common.filter_simple import FirstOrderFilter
 from openpilot.common.realtime import config_realtime_process, DT_MDL
 from openpilot.common.transformations.camera import DEVICE_CAMERAS
 from openpilot.system.camerad.cameras.nv12_info import get_nv12_info
-from openpilot.common.transformations.model import get_warp_matrix
+from openpilot.common.transformations.model import get_warp_matrix, medmodel_intrinsics, sbigmodel_intrinsics
+from openpilot.selfdrive.modeld.camera_offset import apply_camera_offset, camera_height_or_default, clip_camera_offset
 from openpilot.selfdrive.controls.lib.desire_helper import DesireHelper
 from openpilot.selfdrive.controls.lib.drive_helpers import get_accel_from_plan, smooth_value, get_curvature_from_plan
 from openpilot.selfdrive.modeld.parse_model_outputs import Parser
@@ -387,6 +388,7 @@ def main(demo=False):
   lat_smooth_seconds = LAT_SMOOTH_SECONDS
   vEgoStopping = get_stopping_speed(params)
   camera_yaw_trim_deg = params.get_float("CameraYawTrimDeg") * 0.01
+  camera_offset_m = clip_camera_offset(params.get_int("CameraOffsetCm") * 0.01)
   lat_delay_dynamic = lat_smooth_seconds
   diagnostics = RuntimeDiagnostics('modeld', cloudlog.event)
   while True:
@@ -398,6 +400,7 @@ def main(demo=False):
       long_delay = params.get_float("LongActuatorDelay")*0.01
       vEgoStopping = get_stopping_speed(params)
       camera_yaw_trim_deg = params.get_float("CameraYawTrimDeg") * 0.01
+      camera_offset_m = clip_camera_offset(params.get_int("CameraOffsetCm") * 0.01)
       # eGPU power follows ignition on the vehicle. Keep UI state current when
       # the shared USB hub is connected or removed after modeld starts.
       usbgpu_present_now = usbgpu_present()
@@ -434,6 +437,11 @@ def main(demo=False):
       model_transform_main = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if main_wide_camera else dc.fcam.intrinsics, False).astype(np.float32)
       has_wide_camera = use_extra_client or main_wide_camera
       model_transform_extra = get_warp_matrix(device_from_calib_euler, dc.ecam.intrinsics if has_wide_camera else dc.fcam.intrinsics, True).astype(np.float32)
+      if camera_offset_m != 0.0 and calib_done:
+        # tj-test: distance-independent lateral shift of the model's view (see camera_offset.py).
+        camera_height_m = camera_height_or_default(sm["liveCalibration"].height)
+        model_transform_main = apply_camera_offset(model_transform_main, medmodel_intrinsics, camera_offset_m, camera_height_m)
+        model_transform_extra = apply_camera_offset(model_transform_extra, sbigmodel_intrinsics, camera_offset_m, camera_height_m)
       live_calib_seen = True
 
     traffic_convention = np.zeros(2)

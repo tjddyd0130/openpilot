@@ -122,7 +122,8 @@
               "zh": "居中校正",
               "params": [
                 "PathOffset",
-                "CameraYawTrimDeg"
+                "CameraYawTrimDeg",
+                "CameraOffsetCm"
               ]
             },
             {
@@ -668,6 +669,22 @@
       "cdescr": "微调摄像头左右(YAW)值(+: right)",
       "min": -200,
       "max": 200,
+      "default": 0,
+      "unit": 1
+    },
+    {
+      "group": "조향일반",
+      "name": "CameraOffsetCm",
+      "title": "카메라 좌우 오프셋 cm(0)",
+      "descr": "모델이 보는 영상을 지면 기준으로 좌우 평행이동합니다(+: 차량 오른쪽 이동, -: 왼쪽). 거리와 무관하게 일정하게 이동하므로 직선 치우침 보정용이며 캘리브레이션을 멈추지 않습니다. ±20cm, 5cm씩 실차에서 확인하며 조정하세요.",
+      "egroup": "LAT",
+      "etitle": "Camera lateral offset cm(0)",
+      "edescr": "Shifts the model's view sideways on the ground plane (+: car moves right, -: left). Distance independent, for straight-road bias; does not freeze calibration. ±20cm, tune in 5cm steps on the car.",
+      "cgroup": "转向",
+      "ctitle": "摄像头横向偏移 cm(0)",
+      "cdescr": "按地面平面横向平移模型视图(+: 车辆向右, -: 向左)。与距离无关，用于直道偏移校正，不会冻结标定。±20cm，建议每次5cm在车上确认。",
+      "min": -20,
+      "max": 20,
       "default": 0,
       "unit": 1
     },
