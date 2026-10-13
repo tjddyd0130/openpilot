@@ -113,6 +113,18 @@ def test_failed_allocation_falls_back_without_repeated_allocations(layer_env):
   assert active[0] == 73
 
 
+def test_incomplete_nonzero_framebuffer_uses_direct_drawing(layer_env):
+  module, _, rl, active, _ = layer_env
+  rl.rl_framebuffer_complete.return_value = False
+  layer = module.OverlayLayer(0)
+  painted_targets = []
+  for _ in range(3):
+    layer.draw(rl.Rectangle(0, 0, 100, 100), lambda _: painted_targets.append(active[0]), None)
+  assert painted_targets == [73, 73, 73]
+  assert rl.load_render_texture.call_count == 1
+  assert rl.draw_texture_pro.call_count == 0
+
+
 def test_painter_exception_restores_callers_target(layer_env):
   module, _, rl, active, _ = layer_env
   layer = module.OverlayLayer(0)
