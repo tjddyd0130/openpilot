@@ -344,6 +344,7 @@ class CarrotPlanner:
   def check_model_stopping(self, v_cruise, v, v_ego, a_ego, model_x, y, d_rel):
     v_ego_kph = v_ego * CV.MS_TO_KPH
     model_v = self.vFilter.process(v[-1])
+    self.model_end_speed = model_v  # tj: used by the signal start guard's model-go evidence
     startSign = model_v > 5.0 or model_v > (v[0] + 2)
 
     if v_ego_kph < 1.0:
@@ -552,12 +553,19 @@ class CarrotPlanner:
       if start_context is None and self._start_runtime is not None:
         start_observation, start_context = self._start_runtime.read(sm)
       context = start_context or {'now': time.monotonic(), 'enabled': False, 'valid': False, 'drive': False}
+      # tj: the model's own go prediction (computed above, before any veto override) and the
+      # same-lane lead let an occluded/unseen red yield; a fresh strong red still holds.
+      from openpilot.selfdrive.carrot.signal_start_guard import LeadContext
+      lead_ctx = LeadContext(present=bool(lead_detected), distance=float(radarstate.leadOne.dRel),
+                             speed=float(radarstate.leadOne.vLead), lateral=float(radarstate.leadOne.dPath))
       self.start_decision = self.start_guard.update(
         context['now'], start_observation,
         enabled=context['enabled'] and not suspended, valid=context['valid'],
         drive=context['drive'], gas=carstate.gasPressed, speed=v_ego,
         departure=self.trafficState == TrafficState.green or lead_detected or
-                  self.xState not in (XState.e2eStop, XState.e2eStopped))
+                  self.xState not in (XState.e2eStop, XState.e2eStopped),
+        model_go=self.trafficState == TrafficState.green and getattr(self, 'model_end_speed', 0.0) >= 5.0,
+        lead=lead_ctx)
       start_hold = self.start_decision.hold
       if self.start_decision.warn:
         # Bypass unrelated navigation-event cooldown. refuse.wav plays once.

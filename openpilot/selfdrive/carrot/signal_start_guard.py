@@ -1,8 +1,15 @@
 """Opt-in stopped-car red veto, separate from moving signal assistance.
 
 Image position is only a forward-signal hypothesis, not ego-lane association.
-Unknown/stale observations cannot release a latched stop. Green only removes
-this veto; the original planner still decides whether to go.
+Green only removes this veto; the original planner still decides whether to go.
+
+carrot-wip-tj evidence fusion: a *fresh, strong* red (large central housing seen
+in the last RED_FRESH seconds) always keeps the stop. When no red has been seen
+recently (occluded by the lead, above the camera, or lost), the hold yields to
+the driving model's own sustained go prediction or to the same-lane lead
+departing, and after RED_TIMEOUT it expires. A weak red (small/edge box) alone
+cannot overrule model and lead agreeing. Releases only remove the veto; they
+never manufacture a go request.
 """
 from dataclasses import dataclass, asdict
 import json
@@ -52,16 +59,38 @@ class StartDecision:
   reason: str = 'disabled'
 
 
+@dataclass(frozen=True)
+class LeadContext:
+  """Same-lane lead snapshot used for occluded-red release (tj)."""
+  present: bool = False
+  distance: float = 0.0
+  speed: float = 0.0
+  lateral: float = 0.0
+
+
 class SignalStartGuard:
   # Distinct from the old moving assist's 200 ms deadline: measured QCOM
   # capture-to-result is 335 ms mean / 400 ms max in the parked trial.
   MAX_AGE = .65
   MAX_GAP = .7
+  # tj evidence fusion (see module docstring)
+  RED_FRESH = 1.0            # s since the last confirmed red before it counts as "not seen"
+  RED_TIMEOUT = 120.         # s without any red: longer than a signal cycle, drop the hold
+  MODEL_GO_SUSTAIN = .5      # s of continuous model go prediction
+  LEAD_DEPART_SUSTAIN = 1.0  # s of continuous lead departure
+  LEAD_DEPART_GAP = 4.0      # m the lead must open beyond its stopped distance
+  LEAD_DEPART_SPEED = 1.5    # m/s
+  LEAD_ANCHOR_MAX_DIST = 12. # m: a lead this close while stopped is the queue ahead
+  LEAD_ANCHOR_MAX_LAT = 1.0  # m from the model path
+  STRONG_RED_MIN_HEIGHT = 10.   # px in the 1344x760 observation frame
+  STRONG_RED_CENTER = (.40, .60)
+  RELEASE_GRACE = 2.0        # s after a release during which weak red cannot re-hold
 
   def __init__(self):
     self.reset()
     self.last_now = -math.inf
     self.cooldown = -math.inf
+    self.release_grace_until = -math.inf
 
   def reset(self):
     self.hold = False
@@ -74,6 +103,66 @@ class SignalStartGuard:
     self.since = 0.
     self.count = 0
     self.red_anchors = []
+    self.last_red_ts = -math.inf
+    self.last_strong_red_ts = -math.inf
+    self.hold_since = -math.inf
+    self.model_go_since = None
+    self.lead_depart_since = None
+    self.lead_anchor_distance = None
+
+  @classmethod
+  def strong_red(cls, box):
+    try:
+      cx = (box[0]+box[2])/2688
+      return (box[3]-box[1]) >= cls.STRONG_RED_MIN_HEIGHT and cls.STRONG_RED_CENTER[0] <= cx <= cls.STRONG_RED_CENTER[1]
+    except (TypeError, IndexError):
+      return False
+
+  def red_seen_recently(self, now, strong=False):
+    last = self.last_strong_red_ts if strong else self.last_red_ts
+    return math.isfinite(last) and now-last <= self.RED_FRESH
+
+  def _update_fusion_timers(self, now, model_go, lead):
+    if model_go:
+      if self.model_go_since is None:
+        self.model_go_since = now
+    else:
+      self.model_go_since = None
+    departing = False
+    if lead is not None and lead.present:
+      if self.lead_anchor_distance is None and self.hold:
+        if lead.distance <= self.LEAD_ANCHOR_MAX_DIST and abs(lead.lateral) <= self.LEAD_ANCHOR_MAX_LAT and lead.speed < .5:
+          self.lead_anchor_distance = lead.distance
+      if self.lead_anchor_distance is not None:
+        departing = (lead.speed >= self.LEAD_DEPART_SPEED
+                     and lead.distance-self.lead_anchor_distance >= self.LEAD_DEPART_GAP
+                     and abs(lead.lateral) <= self.LEAD_ANCHOR_MAX_LAT)
+    if departing:
+      if self.lead_depart_since is None:
+        self.lead_depart_since = now
+    else:
+      self.lead_depart_since = None
+
+  def fusion_release(self, now):
+    """Reason string when the held stop should yield without a confirmed green, else None."""
+    if not self.hold:
+      return None
+    model_go = self.model_go_since is not None and now-self.model_go_since >= self.MODEL_GO_SUSTAIN
+    lead_gone = self.lead_depart_since is not None and now-self.lead_depart_since >= self.LEAD_DEPART_SUSTAIN
+    if self.red_seen_recently(now, strong=True):
+      return None  # a visible strong red beats model and lead alike
+    if not self.red_seen_recently(now):
+      if model_go:
+        return 'model_go_no_red'
+      if lead_gone:
+        return 'lead_departed_no_red'
+      if math.isfinite(self.last_red_ts) and now-self.last_red_ts >= self.RED_TIMEOUT:
+        return 'red_timeout'
+      return None
+    # only weak red is fresh: it cannot overrule model and lead agreeing
+    if model_go and lead_gone:
+      return 'weak_red_model_lead'
+    return None
 
   def reset_votes(self):
     self.pending, self.count = None, 0
@@ -184,6 +273,9 @@ class SignalStartGuard:
       else:
         self.count += 1
       if color == 'red' and self.count >= 2 and ts-self.since >= .15-1e-9:
+        self.last_red_ts = ts
+        if self.strong_red(selected['box']):
+          self.last_strong_red_ts = ts
         return 'red'
       if color == 'green' and self.count >= 3 and ts-self.since >= .7-1e-9:
         return 'green'
@@ -192,7 +284,8 @@ class SignalStartGuard:
       self.reset_votes()
       return 'malformed'
 
-  def update(self, now, observation, *, enabled, valid, drive, gas, speed, departure):
+  def update(self, now, observation, *, enabled, valid, drive, gas, speed, departure,
+             model_go=False, lead=None):
     if not enabled or not drive:
       self.reset()
       self.last_now = now if math.isfinite(now) else -math.inf
@@ -219,10 +312,24 @@ class SignalStartGuard:
     evidence = self.observe(now, observation)
     released = False
     if evidence == 'red':
+      if not self.hold:
+        if now < self.release_grace_until and not self.red_seen_recently(now, strong=True):
+          # weak red right after a release: do not re-arm, the planner is departing
+          return StartDecision(False, False, False, 'release_grace')
+        self.hold_since = now
+        self.lead_anchor_distance = None
       self.hold = True
     elif evidence in ('green', 'green_group', 'green_transition') and self.hold:
       released = True
       self.reset()
+      self.release_grace_until = now+self.RELEASE_GRACE
+    if self.hold:
+      self._update_fusion_timers(now, model_go, lead)
+      reason = self.fusion_release(now)
+      if reason is not None:
+        self.reset()
+        self.release_grace_until = now+self.RELEASE_GRACE
+        return StartDecision(False, False, True, reason)
     warn = self.hold and departure and not self.warned
     self.warned |= warn
     return StartDecision(self.hold, warn, released, evidence)
