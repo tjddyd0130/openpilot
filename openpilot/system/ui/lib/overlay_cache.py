@@ -45,10 +45,12 @@ class OverlayLayer:
       rl.rl_draw_render_batch_active()
       self.close()
       self._target = rl.load_render_texture(*size)
+      complete = bool(self._target.id and self._target.texture.id and rl.rl_framebuffer_complete(self._target.id))
       rl.rl_enable_framebuffer(previous)
       self._size = size
-      if not self._target.id or not self._target.texture.id:
+      if not complete:
         self.close()
+        rl.rl_enable_framebuffer(previous)
         self._failed = True
         callback(rect)
         return
