@@ -79,6 +79,8 @@ class CarrotPlanner:
     self.prepare_decision = None
     self.prepare_control_active = False
     self.signal_detection_suspended = False
+    self.signal_observation_color = 0
+    self.signal_green_active = False
     self.params = Params()
     self.params_count = 0
     self.frame = 0
@@ -549,10 +551,16 @@ class CarrotPlanner:
       self.trafficState = TrafficState.off
 
     start_hold = False
+    self.signal_observation_color = 0
+    self.signal_green_active = False
     if self.start_guard is not None:
       if start_context is None and self._start_runtime is not None:
         start_observation, start_context = self._start_runtime.read(sm)
       context = start_context or {'now': time.monotonic(), 'enabled': False, 'valid': False, 'drive': False}
+      from openpilot.selfdrive.carrot.signal_start_guard import observation_color
+      self.signal_observation_color = observation_color(
+        start_observation, context['now'], enabled=context['enabled'] and not suspended,
+        valid=context['valid'], drive=context['drive'])
       # tj: the model's own go prediction (computed above, before any veto override) and the
       # same-lane lead let an occluded/unseen red yield; a fresh strong red still holds.
       from openpilot.selfdrive.carrot.signal_start_guard import LeadContext
@@ -567,6 +575,20 @@ class CarrotPlanner:
         model_go=self.trafficState == TrafficState.green and getattr(self, 'model_end_speed', 0.0) >= 5.0,
         lead=lead_ctx)
       start_hold = self.start_decision.hold
+      # A fresh transition from the same previously red signal supplies the
+      # normal green input. It does not set acceleration or bypass driver holds.
+      if (getattr(self.start_decision, 'green_confirmed', False) and v_ego < 5/3.6
+          and self.xState in (XState.e2eStop, XState.e2eStopped, XState.e2eCruise)
+          and self.soft_hold_active == 0 and not self.carrot_stay_stop and self.user_stop_distance < 0
+          and not (carstate.brakePressed or carstate.gasPressed or carstate.leftBlinker or carstate.rightBlinker)
+          and self.trafficLightDetectMode == 2 and self.myDrivingMode != DrivingMode.High):
+        self.trafficState = TrafficState.green
+        self.signal_green_active = True
+        if (self.start_decision.released and self.xState == XState.e2eStopped
+            and getattr(carstate, 'standstill', False) and abs(v_ego) < .1):
+          # The stopped red guard already confirmed >=700ms of fresh green.
+          # Do not add its repeatedly rearmed 0.5s stop timer after release.
+          self.stopping_count = 0
       if self.start_decision.warn:
         # Bypass unrelated navigation-event cooldown. refuse.wav plays once.
         self.events.add(EventName.audioRefuse)
@@ -598,7 +620,7 @@ class CarrotPlanner:
 
     if signal_hold or start_hold:
       # Keep the stop even if a lead appears/moves. Radar obstacles remain in MPC.
-      # Green only removes this override; it never manufactures a go request.
+      # Unknown retains this override; only a confirmed transition can remove it.
       self.xState = XState.e2eStopped
       self.actual_stop_distance = 0.0
       stop_model_x = 0.0
