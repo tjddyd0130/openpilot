@@ -296,6 +296,7 @@
       </div>
 
       <div class="tools-scroll-stack">
+        <section id="externalModelLibrary" class="model-library" hidden></section>
         <section id="egpuModelCard" class="egpu-model-card" hidden aria-live="polite">
           <div class="egpu-model-card__icon" aria-hidden="true">HB</div>
           <div class="egpu-model-card__body">
@@ -310,12 +311,14 @@
             </div>
             <div class="egpu-model-card__footer">
               <span id="egpuModelAmount" class="egpu-model-card__amount"></span>
+              <a id="egpuModelDiagnostics" class="btn egpu-model-card__action" href="/api/egpu/model/diagnostics" download hidden>Download diagnostics</a>
               <button id="btnEgpuCompileRestart" class="btn egpu-model-card__action" type="button" hidden>Restart &amp; compile</button>
             </div>
           </div>
         </section>
 
         <div id="toolsPrimaryActions" class="tools-primary-actions ui-action-grid ui-action-grid--quick mb-md" role="group" aria-label="Tools shortcuts">
+          <a class="btn" href="/navigation" target="_blank" rel="noopener">Nav Map / 지도 검색</a>
           <button id="btnToolsCarSelect" class="btn" type="button">Car Select</button>
           <button id="btnToolsLanguage" class="btn" type="button" aria-haspopup="dialog">Language</button>
           <button id="btnToolsWebSettings" class="btn" type="button">Web Settings</button>

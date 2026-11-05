@@ -9,11 +9,19 @@ from opendbc.car import Bus, create_button_events, structs, DT_CTRL
 from opendbc.car.common.conversions import Conversions as CV
 from opendbc.car.carlog import carlog
 from opendbc.car.hyundai.hyundaicanfd import CanBus
+from opendbc.car.hyundai.navi_speedcam import SpeedcamPolicy
+from opendbc.car.hyundai.section_average import DISTANCE_SCALE as SECTION_DISTANCE_SCALE, SectionAverage
 from opendbc.car.hyundai.steering_touch import HyundaiSteeringTouch
+from opendbc.car.hyundai.rear_gap import tbt_bsd_inputs
+from opendbc.car.hyundai.lane_line_time import lane_line_time
+from opendbc.car.hyundai.vehicle_gps import VehicleGPS, register_vehicle_gps
 from opendbc.car.hyundai.values import HyundaiFlags, CAR, DBC, Buttons, CarControllerParams, CAMERA_SCC_CAR, HyundaiExtFlags, \
                                        EV_MODE_ACTIVE_VALUES, EV_MODE_STATUS_ADDR, EV_MODE_STATUS_DLC, EV_MODE_STATUS_MSG, \
                                        EV_MODE_STATUS_SIGNAL
 from opendbc.car.interfaces import CarStateBase
+from opendbc.car.hyundai.values import get_pedal_interceptor_params
+from opendbc.car.pedal_interceptor import (PEDAL_INTERCEPTOR_BUS,
+                                         PEDAL_INTERCEPTOR_RX_FREQUENCY, PedalInterceptorState)
 
 from openpilot.common.params import Params
 
@@ -35,6 +43,8 @@ VEHICLE_NAVI_CONTROLLED_ACCESS_LINK_CLASSES = (1, 2, 3)  # Freeway, IC, JC
 VEHICLE_NAVI_CONTROLLED_ACCESS_ROAD_CLASSES = (1, 2)  # Freeway, arterial/city freeway
 VEHICLE_NAVI_SCHOOL_ZONE_MAX_DISTANCE = 1000.0
 VEHICLE_NAVI_POSITION_TIMEOUT_NS = 1_000_000_000
+SPEEDCAM_SKIP_MIN_SPEED = 5.0  # m/s; below this + keeps its resume/set-speed role
+SPEEDCAM_GAS_TOK_FRAMES = 40   # matches cruise.py _gas_tok_timer (0.4 s at 100 Hz)
 VEHICLE_NAVI_ROUTE_TIMEOUT_NS = 2_000_000_000
 CANFD_HDA_INFO_MSG = "CANFD_HDA_INFO_364"
 CANFD_NAVI_PROFILE_MSG = "CANFD_NAVI_PROFILE_093"
@@ -222,6 +232,7 @@ class CarState(CarStateBase):
     self.mdps = None
     self.steer_touch_2af = None
     self.steering_touch = HyundaiSteeringTouch()
+    self.vehicle_gps = VehicleGPS()
     self.cruise_buttons_msg = None
     self.cam_0x362 = None
     self.cam_0x2a4 = None
@@ -229,6 +240,9 @@ class CarState(CarStateBase):
     self.accelerator = None
     self.blinkers = None
     self.blinkers_alt = None
+    self.blinker_stalks = None
+    self.left_stalk_prev = self.right_stalk_prev = False
+    self.left_blinker_stalk_count = self.right_blinker_stalk_count = 0
     self.doors_seatbelts = None
     self.cruise_buttons_alt2 = None
 
@@ -244,6 +258,9 @@ class CarState(CarStateBase):
     self.op_params.put_bool("HyundaiCameraSccHint", False)
 
     self.main_enabled = True if self.op_params.get_int("AutoEngage") == 2 else False
+    self.pedal_interceptor_params = get_pedal_interceptor_params(CP)
+    self.pedal_interceptor_state = PedalInterceptorState() if self.pedal_interceptor_params is not None else None
+    self.pedal_interceptor_cruise_blocked = True
     self.manual_main_off_latched = False
     self.gear_shifter = GearShifter.drive # Gear_init for Nexo ?? unknown 21.02.23.LSW
 
@@ -257,6 +274,20 @@ class CarState(CarStateBase):
     self.vehicleNaviSchoolZoneControl = self.op_params.get_bool("VehicleNaviSchoolZoneControl")
     self.vehicleSpeedCameraParamsCounter = 0
     self.vehicleNaviEvents = []
+    # joongyu01/speedcam: stock-navigation camera-kind policy (mobile zones, +-button skip, section average)
+    self.speedcam_policy = SpeedcamPolicy()
+    self.speedcam_accel_swallow = False
+    self.speedcam_engaged = False            # set by card from carControl.enabled
+    self.speedcam_gas_count = 0
+    self.speedcam_gas_tok_consumed = False   # read by card, tells cruise.py to ignore this gas tap
+    self.speedcam_input_consumed = False
+    self.speedcam_v_cruise = 0.0             # set by card from the cruise set speed
+    self.speedcam_decel_count = 0
+    self.speedcam_decel_hold = False         # cruise - held back from cruise.py while a section is unlocked
+    self.speedcam_decel_long_fired = False   # that held press reached the long press (section relocked)
+    self.speedcam_time = 0.0
+    self.section_average = SectionAverage()
+    self._read_speedcam_params()
     self.vehicleNaviSegmentTimestamp = 0
     self.vehicleNaviProfileTimestamp = 0
     self.vehicleNaviAvailable = False
@@ -347,9 +378,11 @@ class CarState(CarStateBase):
       self.manual_main_off_latched = not self.main_enabled
       print(f"main_enabled = {self.main_enabled}")
 
-    # Camera SCC reports the MAIN change after the physical button release.
-    # Do not let that stale state immediately undo an explicit manual MAIN off.
-    if self.CP.openpilotLongitudinalControl and self.MainMode_ACC and not self.manual_main_off_latched:
+    # CameraSCC MAIN can be requested automatically for cluster objects. Driver
+    # intent comes from AutoEngage initialization and the physical buttons above.
+    # Importing that OEM state would raise cruiseState.available and arm steering.
+    if (self.CP.openpilotLongitudinalControl and not self.CP.flags & HyundaiFlags.CAMERA_SCC
+        and self.MainMode_ACC and not self.manual_main_off_latched):
       self.main_enabled = True
 
   def _update_camera_scc_hint(self, cp_cam, canfd):
@@ -474,6 +507,9 @@ class CarState(CarStateBase):
             add_and_cache(self.cp, "ACCELERATOR", "accelerator", ignore_counter = True)
           add_and_cache(self.cp, "BLINKERS", "blinkers")
           add_and_cache(self.cp, "BLINKERS_ALT", "blinkers_alt")
+          # Turn-signal lever pulses (0.04-0.2 s per press, ~5 Hz) on the PT bus only: the alt bus carries an
+          # unrelated 24-byte frame with the same 0x3C1 id (Ioniq 5 PE, 2026-09-19 drive).
+          add_and_cache(self.cp, "BLINKER_STALKS", "blinker_stalks", ignore_counter=True)
           add_and_cache(self.cp, "DOORS_SEATBELTS", "doors_seatbelts")
         elif self.controls_ready_count == 126:
           add_and_cache(self.cp, "CRUISE_BUTTONS_ALT2", "cruise_buttons_alt2", ignore_counter = True)
@@ -557,9 +593,25 @@ class CarState(CarStateBase):
 
       ret.pcmCruiseGap = cp_cruise.vl["SCC11"]["TauGapSet"]
 
+    if self.pedal_interceptor_params is not None:
+      pedal_interceptor_params = self.pedal_interceptor_params
+      self.pedal_interceptor_state.update(can_parsers[Bus.party], pedal_interceptor_params)
+      message, signal = pedal_interceptor_params.cruise_ready
+      address, bit = pedal_interceptor_params.cruise_enabled_bit
+      payload = cp.dat.get(address, b"")
+      ret.cruiseState.enabled = len(payload) == 8 and bool(int.from_bytes(payload, "little") & (1 << bit))
+      cruise_valid = (cp.ts_nanos[message][signal] > 0 and len(payload) == 8 and
+                      cp.message_states[address].valid(cp._last_update_nanos, False))
+      self.pedal_interceptor_cruise_blocked = (not cruise_valid or bool(cp.vl[message][signal]) or ret.cruiseState.enabled)
+      # OEM Cruise ready/engaged takes priority. Keep Carrot's independent
+      # main-switch/controls-initialization gate as well.
+      ret.cruiseState.available = ret.cruiseState.available and not self.pedal_interceptor_cruise_blocked
+      message, signal = pedal_interceptor_params.cruise_speed
+      ret.cruiseState.speed = cp.vl[message][signal] * speed_conv
+
     # TODO: Find brake pressure
     ret.brake = 0
-    if not self.CP.flags & HyundaiFlags.CC_ONLY_CAR:
+    if not self.CP.flags & HyundaiFlags.CC_ONLY_CAR or self.pedal_interceptor_params is not None:
       ret.brakePressed = cp.vl["TCS13"]["DriverOverride"] == 2  # 2 includes regen braking by user on HEV/EV
       ret.brakeHoldActive = cp.vl["TCS15"]["AVH_LAMP"] == 2  # 0 OFF, 1 ERROR, 2 ACTIVE, 3 READY
       ret.parkingBrake = cp.vl["TCS13"]["PBRAKE_ACT"] == 1
@@ -577,6 +629,11 @@ class CarState(CarStateBase):
         ret.accFaulted = cp.vl["TCS13"]["ACCEnable"] != 0
       ret.brakeLights = bool(cp.vl["TCS13"]["BrakeLight"] or ret.brakePressed)
 
+    if self.pedal_interceptor_state is not None:
+      # ACCEnable describes a nonexistent SCC in this adapter. Brake/hold,
+      # parking, ESP, main/READY and CAN health continue through Carrot's paths.
+      ret.accFaulted = self.pedal_interceptor_state.faulted
+
     if self.CP.flags & (HyundaiFlags.HYBRID | HyundaiFlags.EV | HyundaiFlags.FCEV):
       if self.CP.flags & HyundaiFlags.FCEV:
         ret.gas = cp.vl["FCEV_ACCELERATOR"]["ACCELERATOR_PEDAL"] / 254.
@@ -588,6 +645,9 @@ class CarState(CarStateBase):
     else:
       ret.gas = cp.vl["EMS12"]["PV_AV_CAN"] / 100.
       ret.gasPressed = bool(cp.vl["EMS16"]["CF_Ems_AclAct"])
+
+    if self.pedal_interceptor_state is not None and self.pedal_interceptor_state.valid:
+      ret.gasPressed = self.pedal_interceptor_state.gas_pressed
 
     # Gear Selection via Cluster - For those Kia/Hyundai which are not fully discovered, we can use the Cluster Indicator for Gear Selection,
     # as this seems to be standard over all cars, but is not the preferred method.
@@ -690,6 +750,7 @@ class CarState(CarStateBase):
     if prev_main_buttons == 0 and self.main_buttons[-1] != 0:
       self.main_enabled = not self.main_enabled
 
+    ret.vehicleGps = self.vehicle_gps.update(cp, ret.vEgoRaw, ret.gearShifter == GearShifter.reverse)
     return ret
 
   @staticmethod
@@ -725,12 +786,185 @@ class CarState(CarStateBase):
       self.vehicleNaviSchoolZoneControl = vehicle_navi_school_zone_control
       if not vehicle_navi_school_zone_control:
         self._clear_vehicle_navi_school_zone()
+    self._read_speedcam_params()
     return changed
+
+  def _read_speedcam_params(self):
+    # AutoNaviSpeedCtrlMode 3 (+mobile cameras) also decelerates for stock mobile zones (0x4BE kind 3).
+    self.speedcamMobileZoneDecel = self.op_params.get_int("AutoNaviSpeedCtrlMode") >= 3
+    # Deceleration cancel request (+ / gas tap): one master toggle with a toggle per kind in its details.
+    cancel = self.op_params.get_bool("VehicleNaviDecelCancel")
+    self.speedcamSkipBox = cancel and self.op_params.get_bool("VehicleNaviDecelCancelBox")
+    self.speedcamSkipMobileZone = cancel and self.op_params.get_bool("VehicleNaviDecelCancelMobileZone")
+    self.speedcamCancelBump = cancel and self.op_params.get_bool("VehicleNaviDecelCancelBump")
+    self.speedcamSkipUnknown = cancel and self.op_params.get_bool("VehicleNaviDecelCancelUnknown")
+    self.speedcam_policy.early_lead = cancel and self.op_params.get_bool("VehicleNaviDecelCancelEarlyWarning")
+    # carrot_serv's stock-navigation bump source, mirrored to tell when a bump is actually decelerating.
+    self.speedcamBumpDecel = self.op_params.get_int("AutoNaviSpeedCtrlMode") >= 2
+    self.speedcamBumpSpeed = float(self.op_params.get_int("AutoNaviSpeedBumpSpeed"))
+    self.speedcamBumpTime = float(self.op_params.get_int("AutoNaviSpeedBumpTime"))
+    self.speedcamBumpEndDistance = min(5000, max(0, self.op_params.get_int("AutoNaviSpeedBumpEndDistance"))) * 0.01
+    self.speedcamDecelRate = self.op_params.get_int("AutoNaviSpeedDecelRate") * 0.01
+    self.speedcamSectionAvgControl = self.op_params.get_bool("VehicleNaviSectionAvgControl")
+    # The existing section cap is limit x AutoNaviSpeedSafetyFactor (carrot_serv); unlock only above it.
+    self.speedcamSafetyFactor = self.op_params.get_int("AutoNaviSpeedSafetyFactor") * 0.01
+    self.speedcamLongPressFrames = self.op_params.get_int("CruiseButtonLongDelay")  # cruise.py long press
+
+  def _update_speedcam_decel_long_press(self):
+    """True once when cruise - has been held past cruise.py's long-press threshold (the -10 step)."""
+    if self.cruise_buttons[-1] != Buttons.SET_DECEL:
+      self.speedcam_decel_count = 0
+      return False
+    self.speedcam_decel_count += 1
+    return self.speedcam_decel_count == self.speedcamLongPressFrames + 1
+
+  def _update_speedcam_gas_tok(self, gas_pressed):
+    """Mirror cruise.py's gas tap: pressed for fewer than SPEEDCAM_GAS_TOK_FRAMES, reported on release."""
+    if gas_pressed:
+      self.speedcam_gas_count += 1
+      return False
+    gas_tok = 0 < self.speedcam_gas_count < SPEEDCAM_GAS_TOK_FRAMES
+    self.speedcam_gas_count = 0
+    return gas_tok
+
+  def _apply_speedcam_policy(self, ret, speed_limit_cam, warning_active, warning_speed, accel_rising, gas_tok=False):
+    """Suppress a stock camera warning for ignored mobile zones or a +-button / gas-tap skip."""
+    self.speedcam_gas_tok_consumed = False
+    self.speedcam_input_consumed = False
+    if self.canfd_wrapped_navi or not self.vehicleNaviCanControl:
+      self.speedcam_policy.reset_warning()
+      return speed_limit_cam
+    # Only while engaged: otherwise + and a gas tap keep their resume/engage roles.
+    can_skip = self.speedcam_engaged and ret.vEgo > SPEEDCAM_SKIP_MIN_SPEED
+    suppress, consume = self.speedcam_policy.update(
+      warning_active, int(round(warning_speed)), self.totalDistance, can_skip and (accel_rising or gas_tok),
+      self.speedcamMobileZoneDecel, self.speedcamSkipBox, self.speedcamSkipMobileZone,
+      # inside a section its cameras are the section's: + stays the section unlock
+      self.speedcamSkipUnknown and not getattr(ret, "vehicleNaviSectionActive", False))
+    if consume:
+      self._consume_speedcam_input(accel_rising, gas_tok)
+    return False if suppress else speed_limit_cam
+
+  def _speedcam_bump_target_kph(self, distance):
+    """carrot_serv.calculate_current_speed for the bump source (cluster km/h)."""
+    safe = self.speedcamBumpSpeed / 3.6
+    decel_dist = distance - safe * self.speedcamBumpTime
+    if decel_dist <= 0:
+      return self.speedcamBumpSpeed
+    return max(self.speedcamBumpSpeed, min(250.0, math.sqrt(safe ** 2 + 2 * self.speedcamDecelRate * decel_dist) * 3.6))
+
+  def _apply_speedcam_bump_cancel(self, ret, accel_rising, gas_tok):
+    """Deceleration cancel request for stock-navigation speed bumps: while the nearest bump is
+    actually slowing the car (its target below the set speed), + or a gas tap cancels that bump."""
+    if self.canfd_wrapped_navi or not self.vehicleNaviCanControl:
+      return
+    live = [event for event in self.vehicleNaviEvents
+            if event["type"] == "bump" and event["target"] > self.totalDistance and not event.get("cancelled")]
+    ret.speedBumpDistance = live[0]["target"] - self.totalDistance if live else 0.0
+    if (not live or not self.speedcamCancelBump or not self.speedcamBumpDecel or self.speedcam_input_consumed or
+        not (accel_rising or gas_tok) or not self.speedcam_engaged or ret.vEgo <= SPEEDCAM_SKIP_MIN_SPEED):
+      return
+    distance = ret.speedBumpDistance
+    if distance <= self.speedcamBumpEndDistance or self._speedcam_bump_target_kph(distance) >= self.speedcam_v_cruise:
+      return  # carrot_serv is not slowing for this bump: + and the gas tap keep their roles
+    live[0]["cancelled"] = True
+    ret.speedBumpDistance = live[1]["target"] - self.totalDistance if len(live) > 1 else 0.0
+    self._consume_speedcam_input(accel_rising, gas_tok)
+
+  def _consume_speedcam_input(self, accel_rising, gas_tok):
+    # The input spent on a camera skip or section unlock must not also raise the set speed (+1 / gas tap +10).
+    self.speedcam_input_consumed = True
+    self.speedcam_accel_swallow = accel_rising
+    self.speedcam_gas_tok_consumed = gas_tok and not accel_rising
+
+  def _apply_section_average(self, ret, accel_rising, gas_tok, decel_long_press):
+    """Section cap stays at limit x factor until + / gas tap unlocks it; then spend banked time up to the set speed."""
+    self.speedcam_time += DT_CTRL
+    active = (not self.canfd_wrapped_navi and self.speedcamSectionAvgControl and self.vehicleNaviCanControl and
+              ret.vehicleNaviSectionActive and ret.vehicleNaviSpeed > 0)
+    section_speed = int(round(ret.vehicleNaviSpeed)) if active else 0
+    section = self.section_average
+    section.update(active, section_speed, self.speedcam_time, self.totalDistance)
+    if not active:
+      return
+
+    cap_kph = section_speed * self.speedcamSafetyFactor
+    if (not section.unlocked and not self.speedcam_input_consumed and (accel_rising or gas_tok) and self.speedcam_engaged and
+        ret.vEgo > SPEEDCAM_SKIP_MIN_SPEED and self.speedcam_v_cruise > cap_kph):
+      section.unlock()
+      self._consume_speedcam_input(accel_rising, gas_tok)
+    elif section.unlocked and decel_long_press:
+      section.lock()
+    if not section.unlocked:
+      return  # existing section cap and camera distances, unchanged
+
+    # allowance is a true speed; carrot_serv caps at vehicleNaviSpeed x factor as a cluster speed and
+    # the planner drives cluster x vCluRatio in vEgo units, so invert that chain (else ~+3.6 % over).
+    allowance = section.allowance_kph(self.speedcam_time, self.totalDistance)
+    clu_ratio = ret.vCluRatio if ret.vCluRatio > 0.5 else 1.0
+    navi_speed = allowance / SECTION_DISTANCE_SCALE / clu_ratio / max(self.speedcamSafetyFactor, 0.5)
+    if navi_speed > section_speed:
+      ret.vehicleNaviSpeed = navi_speed
+    # Keep spot deceleration only for a same-speed camera ahead (the end camera); no virtual distance.
+    ahead = [event["target"] - self.totalDistance for event in self.vehicleNaviEvents
+             if event["type"] == "camera" and event["speed"] == section_speed and event["target"] > self.totalDistance]
+    ret.speedLimitDistance = min(ahead) if ahead else 0.0
+
+  def _swallow_speedcam_accel(self, button_events):
+    if not self.speedcam_accel_swallow:
+      return button_events
+    kept = []
+    for event in button_events:
+      if event.type == ButtonType.accelCruise:
+        if not event.pressed:
+          self.speedcam_accel_swallow = False
+        continue
+      kept.append(event)
+    return kept
+
+  def _update_blinker_stalks(self, ret):
+    """Turn-signal lever (BLINKER_STALKS): presses (rising edges) into carState.*BlinkerStalkCount, position into blinkerLever."""
+    if self.blinker_stalks is not None:
+      left_stalk, right_stalk = bool(self.blinker_stalks["LEFT_BLINKER"]), bool(self.blinker_stalks["RIGHT_BLINKER"])
+      if left_stalk and not self.left_stalk_prev:
+        self.left_blinker_stalk_count = (self.left_blinker_stalk_count + 1) % 256
+      if right_stalk and not self.right_stalk_prev:
+        self.right_blinker_stalk_count = (self.right_blinker_stalk_count + 1) % 256
+      self.left_stalk_prev, self.right_stalk_prev = left_stalk, right_stalk
+      # *_TAP is set only in the one-touch detent; a latch passes through it for ~0.1 s (2026-10-04 lever test)
+      tap = self.blinker_stalks["LEFT_BLINKER_TAP"] or self.blinker_stalks["RIGHT_BLINKER_TAP"]
+      ret.blinkerLever = 1 if tap else 2 if (left_stalk or right_stalk) else 0
+    ret.leftBlinkerStalkCount = self.left_blinker_stalk_count
+    ret.rightBlinkerStalkCount = self.right_blinker_stalk_count
+
+  def _hold_speedcam_decel(self, button_events, decel_long_press):
+    """While a section is unlocked, cruise - goes to carstate only: a long press relocks the section
+    without cruise.py's -10 step, and a short press is handed to cruise.py at release (where it acts)."""
+    if decel_long_press and self.speedcam_decel_hold:
+      self.speedcam_decel_long_fired = True
+    kept = []
+    for event in button_events:
+      if event.type != ButtonType.decelCruise:
+        kept.append(event)
+      elif event.pressed:
+        if self.section_average.unlocked:
+          self.speedcam_decel_hold = True
+          self.speedcam_decel_long_fired = False
+        else:
+          kept.append(event)
+      elif self.speedcam_decel_hold:
+        if not self.speedcam_decel_long_fired:
+          kept += [structs.CarState.ButtonEvent(pressed=True, type=ButtonType.decelCruise), event]
+        self.speedcam_decel_hold = False
+      else:
+        kept.append(event)
+    return kept
 
   def _clear_vehicle_navi_events(self):
     self.vehicleNaviEvents = []
     self.vehicleNaviCameraTarget = None
     self.vehicleNaviCameraStatusEvent = None
+    self.speedcam_policy.clear()
 
   def _clear_vehicle_navi_route_filtered_events(self):
     if self.vehicleNaviCanControl < 2:
@@ -984,6 +1218,9 @@ class CarState(CarStateBase):
       if timestamp > self.vehicleNaviProfileTimestamp:
         self.vehicleNaviProfileTimestamp = timestamp
         profile = self._decode_vehicle_navi_profile(self.navi_profile_4be)
+        if (not self.canfd_wrapped_navi and profile["profile_type"] == 16 and
+            timestamp > self.vehicleNaviRouteResetTimestamp):
+          self.speedcam_policy.add_preview(profile["value"], profile["offset"], self.totalDistance)
         event = self._classify_vehicle_navi_profile(profile)
         if event is not None and timestamp > self.vehicleNaviRouteResetTimestamp:
           if event[0] == "speed_limit_zone":
@@ -1176,6 +1413,7 @@ class CarState(CarStateBase):
     )
     ret.vEgoRaw = (ret.wheelSpeeds.fl + ret.wheelSpeeds.fr + ret.wheelSpeeds.rl + ret.wheelSpeeds.rr) / 4.
     ret.vEgo, ret.aEgo = self.update_speed_kf(ret.vEgoRaw)
+    ret.vehicleGps = self.vehicle_gps.update(cp, ret.vEgoRaw, ret.gearShifter == GearShifter.reverse)
     ret.standstill = ret.wheelSpeeds.fl <= STANDSTILL_THRESHOLD and ret.wheelSpeeds.rr <= STANDSTILL_THRESHOLD
 
     ret.brakeLights = ret.brakePressed or cp.vl["TCS"]["BrakeLight"] == 1 or ret.aEgo < -0.5
@@ -1217,11 +1455,14 @@ class CarState(CarStateBase):
     ret.steerFaultTemporary = cp.vl["MDPS"]["LKA_FAULT"] != 0 or cp.vl["MDPS"]["LFA2_FAULT"] != 0
     #ret.steerFaultTemporary = False
 
+    self._update_blinker_stalks(ret)
+
     blinkers_info = self.blinkers if self.blinkers is not None else self.blinkers_alt if self.blinkers_alt is not None else None
     if blinkers_info is not None:
       left_blinker_lamp = blinkers_info["LEFT_LAMP"] or blinkers_info["LEFT_LAMP_ALT"]
       right_blinker_lamp = blinkers_info["RIGHT_LAMP"] or blinkers_info["RIGHT_LAMP_ALT"]
       ret.leftBlinker, ret.rightBlinker = self.update_blinker_from_lamp(50, left_blinker_lamp, right_blinker_lamp)
+      ret.blinkerLamp = 1 if left_blinker_lamp else 2 if right_blinker_lamp else 0
 
     if self.CP.enableBsm:
       if self.cp_bsm is None:
@@ -1278,6 +1519,11 @@ class CarState(CarStateBase):
         ret.pcmCruiseGap = int(np.clip(cp_cruise_info.vl["SCC_CONTROL"]["DISTANCE_SETTING"], 1, 4))
       ret.cruiseState.standstill = cp_cruise_info.vl["SCC_CONTROL"]["InfoDisplay"] >= 4
       ret.cruiseState.speed = cp_cruise_info.vl["SCC_CONTROL"]["VSetDis"] * speed_factor
+
+    # The optional 250m trigger uses OEM BSD independently of corner display data.
+    if self.CP.enableBsm:
+      ret.tbtRearInputsAvailable, ret.tbtRightRearBlocked = tbt_bsd_inputs(
+        self.cp_bsm, max(cp._last_update_nanos, cp_cam._last_update_nanos))
 
     speed_limit_cam = False
     corner = False
@@ -1336,6 +1582,7 @@ class CarState(CarStateBase):
     ret.gearStep = cp.vl["GEAR_ALT"]["GEAR_STEP"] if self.GEAR_ALT else ret.gearStep
 
     lane_info = self.cam_0x2a4 if self.cam_0x2a4 is not None else self.cam_0x362
+    ret.laneLineInfoMonoTime = lane_line_time((self.cp_cam, self.cp_alt), lane_info)
 
     if lane_info is not None:
       left_lane_prob = lane_info["LEFT_LANE_PROB"]
@@ -1407,8 +1654,16 @@ class CarState(CarStateBase):
     ret.vCluRatio = (ret.vEgo / vEgoClu) if (vEgoClu > 3. and ret.vEgo > 3.) else 1.0
 
     distance_time_changed = self._update_vehicle_speed_camera_params()
+    speedcam_warning_active, speedcam_warning_speed = speed_limit_cam, ret.speedLimit
     speed_limit_cam = self._update_vehicle_navi_events(cp, ret, speed_limit_cam, cp_alt) or speed_limit_cam
+    speedcam_accel_rising = self.cruise_buttons[-1] == Buttons.RES_ACCEL and prev_cruise_buttons != Buttons.RES_ACCEL
+    speedcam_gas_tok = self._update_speedcam_gas_tok(ret.gasPressed)
+    speed_limit_cam = self._apply_speedcam_policy(ret, speed_limit_cam, speedcam_warning_active, speedcam_warning_speed,
+                                                  speedcam_accel_rising, speedcam_gas_tok)
+    self._apply_speedcam_bump_cancel(ret, speedcam_accel_rising, speedcam_gas_tok)
     self.update_speed_limit(ret, speed_limit_cam, distance_time_changed)
+    speedcam_decel_long_press = self._update_speedcam_decel_long_press()
+    self._apply_section_average(ret, speedcam_accel_rising, speedcam_gas_tok, speedcam_decel_long_press)
 
     paddle_button = self.paddle_button_prev
     if self.cruise_btns_msg_canfd == "CRUISE_BUTTONS":
@@ -1416,9 +1671,12 @@ class CarState(CarStateBase):
     elif self.gear_msg_canfd == "GEAR":
       paddle_button = 1 if cp.vl["GEAR"]["LEFT_PADDLE"] == 1 else 2 if cp.vl["GEAR"]["RIGHT_PADDLE"] == 1 else 0
 
-    ret.buttonEvents = [*create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
-                        *create_button_events(paddle_button, self.paddle_button_prev, {1: ButtonType.paddleLeft, 2: ButtonType.paddleRight}),
-                        *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise})]
+    # Filter the Python list before the single capnp assignment: re-assigning a
+    # capnp list field from itself clears the source first and zeroes every event.
+    ret.buttonEvents = self._hold_speedcam_decel(self._swallow_speedcam_accel([
+      *create_button_events(self.cruise_buttons[-1], prev_cruise_buttons, BUTTONS_DICT),
+      *create_button_events(paddle_button, self.paddle_button_prev, {1: ButtonType.paddleLeft, 2: ButtonType.paddleRight}),
+      *create_button_events(self.main_buttons[-1], prev_main_buttons, {1: ButtonType.mainCruise})]), speedcam_decel_long_press)
 
     self.paddle_button_prev = paddle_button
 
@@ -1438,7 +1696,7 @@ class CarState(CarStateBase):
       ]
 
     CAN = CanBus(CP)
-    pt_parser = CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CAN.ECAN)
+    pt_parser = register_vehicle_gps(CANParser(DBC[CP.carFingerprint][Bus.pt], msgs, CAN.ECAN))
     if CP.extFlags & HyundaiExtFlags.EV_MODE_STATUS_230:
       # Display-only while the signal is fleet-validated: checksum and freshness
       # gate the value without making a counter/alive fault disable controls.
@@ -1454,9 +1712,16 @@ class CarState(CarStateBase):
     if CP.flags & HyundaiFlags.CANFD:
       return self.get_can_parsers_canfd(CP)
 
-    return {
+    parsers = {
       # EMS21 carries SCR_UREA_LEVEL on diesel platforms. NaN frequency makes
       # it optional, so gasoline/EV platforms do not fail CAN validity.
-      Bus.pt: CANParser(DBC[CP.carFingerprint][Bus.pt], [("EMS21", math.nan)], 0),
+      Bus.pt: register_vehicle_gps(CANParser(DBC[CP.carFingerprint][Bus.pt], [("EMS21", math.nan)], 0)),
       Bus.cam: CANParser(DBC[CP.carFingerprint][Bus.pt], [], 2),
     }
+    pedal_interceptor_params = get_pedal_interceptor_params(CP)
+    if pedal_interceptor_params is not None:
+      parsers[Bus.party] = CANParser(pedal_interceptor_params.dbc_name, [("GAS_SENSOR", PEDAL_INTERCEPTOR_RX_FREQUENCY)],
+                                    PEDAL_INTERCEPTOR_BUS)
+      # Register the configured OEM CC input at its actual receive rate.
+      parsers[Bus.pt]._add_message(pedal_interceptor_params.cruise_ready[0], 10)
+    return parsers

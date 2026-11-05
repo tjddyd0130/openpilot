@@ -100,6 +100,10 @@ def test_jetson_images_download_head_resume_and_file_allowlist(tmp_path):
   asyncio.run(run())
 
 
+
+
+
+
 @pytest.mark.parametrize('component', ['downloads', 'jetson', 'v0.2.0-preview', 'carrot-jetson.img.zst'])
 def test_jetson_download_rejects_symlink_at_each_component(tmp_path, component):
   async def run():

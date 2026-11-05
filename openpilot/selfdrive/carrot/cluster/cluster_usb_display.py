@@ -295,7 +295,7 @@ class TuringUsbDisplay:
         if self.profile_enabled:
             self._profile_samples.append((name, (time.perf_counter() - start_time) * 1000.0))
 
-    def open(self) -> None:
+    def _load_protocol_helpers(self) -> None:
         if not VENDOR_LIBRARY.exists():
             raise RuntimeError(f"TURZX vendor library not found: {VENDOR_LIBRARY}")
         self._add_libusb_search_path()
@@ -329,6 +329,9 @@ class TuringUsbDisplay:
         self._cmd_play_h264_chunk = CMD_PLAY_H264_CHUNK
         self._cmd_get_stream_status = CMD_GET_STREAM_STATUS
         self._cmd_stop_stream = CMD_STOP_STREAM
+
+    def open(self) -> None:
+        self._load_protocol_helpers()
         self._connect_device()
         try:
             self._initialize_device()
@@ -720,7 +723,7 @@ class TuringUsbDisplay:
 
         chunk_size = self._h264_chunk_size(requested_chunk_size)
         self._h264_chunk_gap_s = 0.0
-        if _usbgpu_transfer_active():
+        if getattr(self, "uses_host_usb", True) and _usbgpu_transfer_active():
             negotiated_chunk_size = chunk_size
             chunk_size = min(chunk_size, USBGPU_H264_MAX_CHUNK_SIZE)
             self._h264_chunk_gap_s = USBGPU_H264_CHUNK_GAP_S

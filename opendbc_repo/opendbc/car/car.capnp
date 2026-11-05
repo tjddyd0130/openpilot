@@ -202,7 +202,7 @@ struct CarState {
   espDisabled @32 :Bool;
   accFaulted @42 :Bool;
   carFaultedNonCritical @47 :Bool;  # some ECU is faulted, but car remains controllable
-  radarDisableFailed @100 :Bool;     # VW DISABLE_RADAR: radar knockout at init failed (long will fault)
+  radarDisableFailed @113 :Bool;     # VW DISABLE_RADAR: radar knockout at init failed (long will fault)
   espActive @51 :Bool;
   vehicleSensorsInvalid @52 :Bool;  # invalid steering angle readings, etc.
   lowSpeedAlert @56 :Bool;  # lost steering control due to a dynamic min steering speed
@@ -279,6 +279,29 @@ struct CarState {
   vehicleNaviAvailable @92 :Bool; # stock-navigation 0x4BE has been observed during this drive
   radarInput @93 :RadarInput;
   steeringTouch @94 :SteeringTouch;
+  leftBlinkerStalkCount @100 :UInt8;  # +1 (wrapping) on every left turn-signal lever press; the lamp-based leftBlinker cannot show a press while the lamp is already flashing
+  rightBlinkerStalkCount @101 :UInt8; # +1 (wrapping) on every right turn-signal lever press
+  blinkerLever @102 :UInt8;           # turn-signal lever position: 0 released, 1 one-touch (half) detent, 2 latched
+  blinkerLamp @103 :UInt8;            # turn-signal lamp right now (no hold): 0 dark, 1 left lit, 2 right lit
+
+  vehicleGps @104 :VehicleGps;
+  autoTurnSignalDirection @105 :UInt8; # automatic ownership, including an unconfirmed cancellation tail
+  autoTurnSignalStatus @106 :Text;
+  turnSignalDriverValid @107 :Bool;
+  turnSignalDriverDirection @108 :UInt8; # actual stalk: 0 released, 1 left, 2 right
+  autoTurnSignalReadyRequestId @109 :UInt64; # TX echoed and lamps confirmed for this automatic maneuver; zero otherwise
+  tbtRearInputsAvailable @110 :Bool; # fresh CANFD OEM BSD input for the TBT physical-indicator trigger only (BSD-only since 2026-10-30)
+  tbtRightRearBlocked @111 :Bool = true; # OEM right BSD warning or invalid/stale BSD; no corner-distance veto; manual admission unchanged
+  laneLineInfoMonoTime @112 :UInt64; # exact OEM lane type/colour CAN observation; zero means unknown, manual indicator only
+  struct VehicleGps {
+    available @0 :Bool;
+    valid @1 :Bool; # receive/continuity checks, not a decoded satellite fix flag
+    latitude @2 :Float64;
+    longitude @3 :Float64;
+    sampleMonoTime @4 :UInt64;
+    headingDeg @5 :Float32; # course derived from consecutive positions
+    headingValid @6 :Bool;
+  }
 
   # Optional original vehicle receive signal. Separate from torque/override.
   struct SteeringTouch {
@@ -378,6 +401,8 @@ struct RadarData @0x888ad6581cf0aacb {
   errors @3 :Error;
   points @1 :List(RadarPoint);
   radarTrackFlipped @4 :Bool; # frontRadar yRel/yvRel already inverted by RadarTrackFlip
+  displayPoints @5 :List(RadarPoint); # 제어 points와 분리한 전체 표시용 객체
+  hasDisplayData @6 :Bool; # 표시 스트림 지원 표지: 빈 목록·시작·오류에도 유지
 
   struct Error {
     canError @0 :Bool;
@@ -511,6 +536,7 @@ struct CarControl {
     leadLimiting @21: Bool;     # VW MEB cluster: 앞차가 속도를 제한 중(xState lead) -> 앞차 하이라이트 우선
 
     driverMonitoringAlert @22: UInt8;  # 0=none, 1=initial, 2=audible, 3=terminal; fresh enabled DM only
+    physicalBlinkerHold @23: UInt8;  # 0=legacy, 1=release, 2=left hold, 3=right hold; fresh USB-CAN lease
 
     # not used with the dash, TODO: separate structs for dash UI and device UI
     audibleAlert @5: AudibleAlert;

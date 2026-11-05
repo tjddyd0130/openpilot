@@ -18,6 +18,7 @@ Bring-up (scripts/setup_gadget.sh does all of this):
 """
 from __future__ import annotations
 
+import _signal
 import errno
 import logging
 import os
@@ -316,7 +317,10 @@ class FfsTransport(StreamTransport):
     reader, self._reader = self._reader, None
     if reader is not None and reader is not threading.current_thread():
       reader.join(READER_JOIN_TIMEOUT)
-    self._close_fds(('ep_in', 'ep_out'), reader)
+    try:
+      self._close_request_writer()
+    finally:
+      self._close_fds(('ep_in', 'ep_out'), reader)
     # Whatever the last exchange left behind goes with the endpoints: half a
     # message would frame the next one's first reply as garbage.
     with self._cv:
@@ -438,18 +442,89 @@ class FfsTransport(StreamTransport):
     self.unbind(self._owner_gadget)
 
   def send(self, *args, **kwargs) -> None:
+    self._poll_bounded_requests()
     # Reset the quantum at each message: a latched shrink would split every
     # later request across two writes and re-arm the dwc3 replay (see
     # write_chunk). The pressure that forced it is usually gone by the next
     # frame.
     self.write_chunk = type(self).write_chunk
+    from jetlink import request_chunks
+    kind = args[0] if args else kwargs.get('msg_type')
+    if getattr(self, 'request_chunks_enabled', False) and kind in request_chunks.KINDS:
+      # Preserve checked logical envelopes across physical write boundaries.
+      # Sub-envelope replay fails CRC/framing and closes the session; it must
+      # never become unchecked model input.
+      return self._send_bounded_request(*args, **kwargs)
     super().send(*args, **kwargs)
+
+  def _prepare_bounded_requests(self):
+    # Prepare once during HELLO, before any model request/deadline exists.
+    from jetlink.transport.request_writer import library, Writer
+    if getattr(self, '_request_writer', None) is not None:
+      return True
+    lib = library()
+    if lib is None:
+      return False
+    try:
+      self._ensure_epfiles()
+      deferred = os.getenv('JETLINK_DEFER_COMPLETIONS', '1') == '1'
+      quantum = 8192 if deferred and os.getenv('JETLINK_AIO_WRITE_BYTES', '8192') == '8192' else 32768
+      self._request_writer = Writer(self.ep_in, lib, deferred=deferred, quantum=quantum)
+      return True
+    except OSError:
+      return False
+
+  def _poll_bounded_requests(self):
+    writer = getattr(self, '_request_writer', None)
+    if getattr(writer, 'deferred', False):
+      try:
+        writer.poll()
+      except OSError as exc:
+        raise LinkError('bounded USB completion failed; abandoning this session') from exc
+
+  def _send_bounded_request(self, msg_type, seq, parts=(), flags=0, timeout=None):
+    from jetlink import request_chunks
+    parts = tuple(parts)
+    writer = getattr(self, '_request_writer', None)
+    deadline = time.monotonic() + min(request_chunks.MAX_AGE, timeout if timeout is not None else request_chunks.MAX_AGE)
+    self._bounded_envelope = True
+    try:
+      if sum(memoryview(p).nbytes for p in parts) <= request_chunks.DATA_BYTES:
+        return super().send(msg_type, seq, parts, flags, timeout)
+      if writer is None:
+        return request_chunks.send(super().send, msg_type, seq, parts, flags, timeout)
+      if self.protocol_version != 2 or self.tx_align != request_chunks.P.GADGET_TX_ALIGN:
+        raise LinkError('bounded native requests require protocol-2 gadget framing')
+      self._lock_protocol_version()
+      packets = request_chunks.packets(msg_type, seq, parts, flags)
+      budget = deadline - time.monotonic()
+      if budget <= 0:
+        raise LinkTimeout('bounded request preparation deadline exceeded')
+      self._write_budget = budget
+      was = _signal.pthread_sigmask(signal.SIG_BLOCK, _IO_SIGNALS)
+      try:
+        if not self._write_guard.arm(budget):
+          raise LinkError('gadget write watchdog already expired or closed')
+        try:
+          writer.send(packets, budget)
+          self._had_host = True
+        except OSError as exc:
+          raise LinkError('bounded USB request failed; abandoning this session') from exc
+      finally:
+        completed = self._write_guard.disarm()
+        _signal.pthread_sigmask(signal.SIG_SETMASK, was)
+        if not completed:
+          raise LinkError('bounded request watchdog expired; link abandoned')
+    finally:
+      self._bounded_envelope = False
 
   def _write(self, bufs: list[memoryview]) -> int:
     self._ensure_epfiles()
     self._write_budget = self._write_timeout(WRITE_TIMEOUT)
     # See _IO_SIGNALS: a signal here duplicates data on the wire.
-    was = signal.pthread_sigmask(signal.SIG_BLOCK, _IO_SIGNALS)
+    # The public wrapper converts every returned number to an enum in Python.
+    # Use its identical C primitive and preserve the raw mask for restoration.
+    was = _signal.pthread_sigmask(signal.SIG_BLOCK, _IO_SIGNALS)
     try:
       if not self._write_guard.arm(self._write_budget):
         raise LinkError('gadget write watchdog already expired or closed')
@@ -467,6 +542,8 @@ class FfsTransport(StreamTransport):
           # nothing on the wire and is safe to retry.
           if e.errno in _NOT_READY and self._wait_for_host_ready():
             continue
+          if e.errno == errno.ENOMEM and getattr(self, '_bounded_envelope', False):
+            raise LinkError('small framed USB request allocation failed') from e
           if e.errno == errno.ENOMEM and self._shrink_write():
             # A short write is fine: send() loops until the message is out.
             bufs = take(bufs, self.write_chunk)
@@ -474,7 +551,7 @@ class FfsTransport(StreamTransport):
           raise LinkError(f"gadget write failed: {e}{self._udc_note()}") from e
     finally:
       completed = self._write_guard.disarm()
-      signal.pthread_sigmask(signal.SIG_SETMASK, was)
+      _signal.pthread_sigmask(signal.SIG_SETMASK, was)
       if not completed:
         raise LinkError('gadget write had no reader before deadline; link abandoned')
 
@@ -505,6 +582,18 @@ class FfsTransport(StreamTransport):
       pass
 
   def _read_loop(self) -> None:
+    try:
+      self._read_loop_body()
+    finally:
+      self._finish_reads()
+
+  def _read_packet(self, buf) -> int:
+    return os.readv(self.ep_out, [buf])
+
+  def _finish_reads(self) -> None:
+    pass
+
+  def _read_loop_body(self) -> None:
     # As in _write: an interrupted read drops the packets it already took. This
     # thread handles no signals, so mask them for its whole life.
     signal.pthread_sigmask(signal.SIG_BLOCK, _IO_SIGNALS)
@@ -541,7 +630,7 @@ class FfsTransport(StreamTransport):
       try:
         # Multiples of the packet size only: the OUT endpoint rejects anything
         # else, and _read_size is only ever halved from one.
-        got = os.readv(self.ep_out, [buf])
+        got = self._read_packet(buf)
       except OSError as e:
         if self._closing:
           return
@@ -572,7 +661,10 @@ class FfsTransport(StreamTransport):
     # Per-message maxima, in seconds. read_wait covers the peer and kernel IO,
     # handoff the consumer's wake; neither is a pure scheduler measurement.
     self.last_receive = {'prepare': 0.0, 'read_wait': 0.0, 'handoff': 0.0}
-    return super().recv(timeout)
+    self._poll_bounded_requests()
+    message = super().recv(timeout)
+    self._poll_bounded_requests()
+    return message
 
   def _read_into(self, dest: memoryview, timeout: float | None) -> int:
     self._ensure_epfiles()
@@ -655,7 +747,18 @@ class FfsTransport(StreamTransport):
       reader.join(READER_JOIN_TIMEOUT)
     with self._cv:
       self._cv.notify_all()
-    self._close_fds(('_state_fd', 'ep_in', 'ep_out', 'ep0'), reader)
+    try:
+      self._close_request_writer()
+    finally:
+      self._close_fds(('_state_fd', 'ep_in', 'ep_out', 'ep0'), reader)
+
+  def _close_request_writer(self):
+    writer = getattr(self, '_request_writer', None)
+    if writer is not None:
+      # Propagate failure to the daemon's existing unsafe-cleanup gate. Do not
+      # create another session while an old native context still owns buffers.
+      writer.close()
+      self._request_writer = None
 
   def _close_fds(self, names, reader: threading.Thread | None) -> None:
     """Close these descriptors, clearing each as it goes.

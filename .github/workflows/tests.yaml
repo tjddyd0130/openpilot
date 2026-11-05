@@ -37,6 +37,11 @@ jobs:
             openpilot/selfdrive/modeld/tests/test_big_model_startup.py \
             openpilot/selfdrive/modeld/tests/test_big_model.py \
             openpilot/selfdrive/modeld/tests/test_big_model_delivery.py \
+            openpilot/selfdrive/modeld/tests/test_precompiled_model.py \
+            openpilot/selfdrive/modeld/tests/test_precompiled_rejection_retry.py \
+            openpilot/selfdrive/modeld/tests/test_egpu_worker_progress.py \
+            openpilot/selfdrive/modeld/tests/test_egpu_events.py \
+            openpilot/selfdrive/modeld/tests/test_egpu_recovery.py \
             openpilot/selfdrive/modeld/tests/test_helpers.py::test_usbgpu_compiled_path_waits_for_selected_model_instead_of_previous \
             openpilot/system/tests/test_model_build_cache.py \
             openpilot/system/tests/test_launch_order.py
@@ -63,7 +68,7 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python -m pip install pytest numpy
+      - run: python -m pip install pytest numpy pycapnp
       - name: Check speed mismatch, original deceleration and planner routing
         run: >-
           python -m pytest -c /dev/null --rootdir=. --confcutdir=openpilot/selfdrive/controls/tests -q
@@ -106,8 +111,36 @@ jobs:
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_birth.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_mirror_m3.py \
             opendbc_repo/opendbc/car/hyundai/tests/test_bosch_road_edge.py
+      - name: Check temporary navigation destinations and native Params
+        run: >-
+          python -m pytest -o addopts='' -q
+          openpilot/common/tests/test_params.py::TestParams::test_temporary_navigation_destination_lifecycle
+          openpilot/selfdrive/navigation/tests/test_route_engine.py
+          openpilot/selfdrive/carrot/server/tests/test_navigation_map.py
+          openpilot/selfdrive/navd/tests/test_instruction_serialization.py
       - name: Check passive camera SOF diagnostics
         run: openpilot/system/camerad/test/test_camera_event_timing
+      - name: Check Hyundai navigation and lever features and RAV4 ARS integration
+        run: >-
+          python -m pytest -o addopts='' -q
+          opendbc_repo/opendbc/car/hyundai/tests/test_navi_speedcam.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_section_average.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_speed_camera.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_blink_hold.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_blinker_stalks.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_ccnc_cluster.py
+          opendbc_repo/opendbc/car/hyundai/tests/test_carstate_buttons.py
+          openpilot/selfdrive/car/tests/test_camera_scc_steering_intent.py
+          opendbc_repo/opendbc/car/toyota/tests/test_ars510_carrot.py
+          opendbc_repo/opendbc/car/toyota/tests/test_ars510_display.py
+          openpilot/selfdrive/car/tests/test_toyota_pcm_mode0.py
+          openpilot/selfdrive/carrot/tests/test_radar_forced_scc_gate.py
+          openpilot/selfdrive/carrot/tests/test_radar_display_flip.py
+          openpilot/selfdrive/carrot/tests/test_radarcan_process.py
+          openpilot/selfdrive/carrot/tests/test_rav4_radar_slowdown.py
+          openpilot/selfdrive/controls/tests/test_desire_helper_stalk.py
+          openpilot/selfdrive/controls/tests/test_lever_forced_turn.py
+          openpilot/selfdrive/ui/tests/test_radar_display.py
       - name: Check coherent OS04C10 exposure updates
         run: openpilot/system/camerad/test/test_os04c10_exposure
       - name: Check UI geometry and rendering regressions
@@ -122,9 +155,16 @@ jobs:
           openpilot/common/tests/test_display_scheduling.py
           openpilot/system/tests/test_camera_cpu_placement.py
           openpilot/selfdrive/ui/tests/test_carrot_ui_sched.py
+      # Keep forked replay workers separate from threaded model artifact tests.
+      - name: Check radar replay worker integration
+        timeout-minutes: 4
+        run: >-
+          python -m pytest -o addopts='' -o faulthandler_timeout=60 -vv -s
+          openpilot/selfdrive/controls/tests/test_leads.py
       - name: Check model, monitoring and Bluetooth integration
+        timeout-minutes: 4
         run: |
-          python -m pytest -o addopts='' -q \
+          python -m pytest -o addopts='' -o faulthandler_timeout=60 -vv \
             openpilot/common/tests/test_egpu_diagnostics.py \
             openpilot/selfdrive/monitoring/test_monitoring.py \
             openpilot/selfdrive/monitoring/test_dm2.py \
@@ -152,7 +192,6 @@ jobs:
             openpilot/selfdrive/carrot/tests/test_radar_cutout_fast_path.py \
             openpilot/selfdrive/carrot/tests/test_cluster_performance_safeguards.py \
             openpilot/selfdrive/carrot/tests/test_cluster_autorun.py \
-            openpilot/selfdrive/controls/tests/test_leads.py \
             openpilot/selfdrive/carrot/bluetooth/tests \
             openpilot/selfdrive/car/tests/test_carrot_cruise_buttons.py \
             opendbc_repo/opendbc/car/volkswagen/tests/test_carstate_buttons.py \

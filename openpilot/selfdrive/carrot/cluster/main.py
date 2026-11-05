@@ -68,7 +68,7 @@ from cluster_h264_pipeline import (
 from cluster_live import OpenpilotLiveSource
 from cluster_models import RouteOverlay, SimulatorInput
 from cluster_navi_overlay import merge_navi_overlay_state
-from cluster_profile import GcProfileHook, ProfileReporter, freeze_gc_after_init
+from cluster_profile import GcProfileHook, ProfileReporter, freeze_gc_after_init, restore_gc_after_run
 from cluster_renderer import ClusterUiRenderer
 from cluster_route_replay import (
     ROUTE_CORNER_SOURCE_CHOICES,
@@ -287,7 +287,9 @@ class ClusterClockVisibilityParamReader:
 
 
 class ClusterUsbFpsReader:
-    def __init__(self) -> None:
+    def __init__(self, normal_fps: float = 10.0, *, egpu_max_fps: float = 5.0) -> None:
+        self.normal_fps = normal_fps
+        self.egpu_max_fps = egpu_max_fps
         self._params = None
         try:
             from openpilot.common.params import Params
@@ -298,11 +300,11 @@ class ClusterUsbFpsReader:
 
     def read(self) -> float:
         if self._params is None:
-            return 10.0
+            return self.normal_fps
         try:
-            return 5.0 if self._params.get_bool("UsbGpuActive") else 10.0
+            return min(self.egpu_max_fps, self.normal_fps) if self._params.get_bool("UsbGpuActive") else self.normal_fps
         except Exception:
-            return 10.0
+            return self.normal_fps
 
 
 class ClusterHudBrightnessParamReader:
@@ -686,6 +688,7 @@ def run_demo(
     hud_encoder_watch: int | None,
     language: str | None,
     is_metric: bool | None,
+    usb_h264_ffmpeg_threads: int = 0,
 ) -> None:
     scheduler = DisplayScheduler(4, enabled=TICI)
     scheduler.update(False, force=True)
@@ -744,18 +747,16 @@ def run_demo(
         # mandatory sync transaction immediately after USB initialization.
         usb_display.set_orientation(active_orientation)
         usb_display.set_profile_enabled(profile_render)
-        profile_stage = time.perf_counter()
-        try:
-            usb_display.open()
-        except Exception:
-            usb_display.close()
-            raise
-        profile.add_elapsed("usb.open", profile_stage)
-        profile.add_samples(usb_display.profile_samples())
-        usb_display.clear_profile_samples()
-        if usb_async and usb_codec == "jpeg":
-            usb_pipeline = AsyncJpegUsbPipeline(usb_display)
-            usb_pipeline.start()
+        if not getattr(usb_display, "open_after_renderer", False):
+            profile_stage = time.perf_counter()
+            try:
+                usb_display.open()
+            except Exception:
+                usb_display.close()
+                raise
+            profile.add_elapsed("usb.open", profile_stage)
+            profile.add_samples(usb_display.profile_samples())
+            usb_display.clear_profile_samples()
 
     frame_width = width or (usb_display.landscape_width if usb_display is not None else DESIGN_WIDTH)
     frame_height = height or (usb_display.landscape_height if usb_display is not None else DESIGN_HEIGHT)
@@ -1018,6 +1019,7 @@ def run_demo(
         )
         return True
 
+    previous_gc_thresholds = None
     try:
         if hud_output_gate_param_reader is not None and not hud_output_gate_param_reader.allowed():
             print(
@@ -1034,6 +1036,16 @@ def run_demo(
         renderer.open(hidden=output_mode == "usb")
         profile.add_samples(renderer.profile_samples())
         renderer.clear_profile_samples()
+        if usb_display is not None:
+            if getattr(usb_display, "open_after_renderer", False):
+                profile_stage = time.perf_counter()
+                usb_display.open()
+                profile.add_elapsed("usb.open", profile_stage)
+                profile.add_samples(usb_display.profile_samples())
+                usb_display.clear_profile_samples()
+            if usb_async and usb_codec == "jpeg":
+                usb_pipeline = AsyncJpegUsbPipeline(usb_display)
+                usb_pipeline.start()
         if usb_display is not None and usb_codec == "h264":
             h264_encoder_fps = resolved_h264_encoder_fps(target_fps, usb_h264_fps)
             h264_pipeline = H264UsbPipeline(
@@ -1059,6 +1071,7 @@ def run_demo(
                 usb_h264_dump,
                 usb_h264_debug,
                 usb_h264_diagnose_interval_s,
+                ffmpeg_threads=usb_h264_ffmpeg_threads,
             )
             profile_stage = time.perf_counter()
             h264_pipeline.start()
@@ -1118,7 +1131,7 @@ def run_demo(
                     flush=True,
                 )
         if gc_freeze_init:
-            freeze_gc_after_init(profile)
+            previous_gc_thresholds = freeze_gc_after_init(profile)
         while True:
             if stop_requested:
                 break
@@ -1897,37 +1910,45 @@ def run_demo(
                 report_frames = 0
                 last_report_time = now
     finally:
-        if usb_display is not None:
-            _set_cluster_hud_connected(False)
-        scheduler.update(False, force=True, child_pid=h264_pipeline.encoder_pid if h264_pipeline is not None else None)
-        if signal_installed:
-            signal.signal(signal.SIGTERM, previous_sigterm_handler)
-        if gc_hook is not None:
+        try:
+            # Restore even if a later native-resource close raises an exception.
+            restore_gc_after_run(previous_gc_thresholds)
+            if usb_display is not None:
+                _set_cluster_hud_connected(False)
+            scheduler.update(False, force=True, child_pid=h264_pipeline.encoder_pid if h264_pipeline is not None else None)
+            if signal_installed:
+                signal.signal(signal.SIGTERM, previous_sigterm_handler)
+            if gc_hook is not None:
+                try:
+                    gc.callbacks.remove(gc_hook)
+                except ValueError:
+                    pass
+            network_address_provider.close()
+            if cluster_core_usage_sampler is not None:
+                cluster_core_usage_sampler.close()
+            renderer.release_nv12_dmabuf_output()
+            if h264_pipeline is not None:
+                h264_pipeline.close()
+            if usb_pipeline is not None:
+                usb_pipeline.close()
+            if controller is not None:
+                controller.close()
+            if route_tools_window is not None:
+                route_tools_window.close()
+            if route_source is not None:
+                route_source.close()
+            if live_source is not None:
+                live_source.close()
+            if navi_source is not None:
+                navi_source.close()
+        finally:
+            # A transport close may wait or receive the manager's SIGINT. Release
+            # graphics first, even if an earlier cleanup step was interrupted.
             try:
-                gc.callbacks.remove(gc_hook)
-            except ValueError:
-                pass
-        network_address_provider.close()
-        if cluster_core_usage_sampler is not None:
-            cluster_core_usage_sampler.close()
-        renderer.release_nv12_dmabuf_output()
-        if h264_pipeline is not None:
-            h264_pipeline.close()
-        if usb_pipeline is not None:
-            usb_pipeline.close()
-        if controller is not None:
-            controller.close()
-        if route_tools_window is not None:
-            route_tools_window.close()
-        if route_source is not None:
-            route_source.close()
-        if live_source is not None:
-            live_source.close()
-        if navi_source is not None:
-            navi_source.close()
-        if usb_display is not None:
-            usb_display.close()
-        renderer.close()
+                renderer.close()
+            finally:
+                if usb_display is not None:
+                    usb_display.close()
 
 
 def parse_args() -> argparse.Namespace:
@@ -2093,6 +2114,13 @@ def parse_args() -> argparse.Namespace:
             "ffmpeg H264 encoder for --usb-h264-backend ffmpeg. "
             "Default libx264; auto prefers h264_v4l2m2m, then h264_omx, then libx264."
         ),
+    )
+    parser.add_argument(
+        "--usb-h264-ffmpeg-threads",
+        type=int,
+        choices=range(17),
+        default=0,
+        help="libx264 encoder and conversion threads (0: automatic; 1: minimum CPU concurrency).",
     )
     parser.add_argument(
         "--usb-h264-device",
@@ -2407,6 +2435,7 @@ def parse_args() -> argparse.Namespace:
     args.fps_from_cli = args.fps is not None
     args.usb_codec_from_cli = option_present(raw_args, "--usb-codec")
     args.usb_h264_backend_from_cli = option_present(raw_args, "--usb-h264-backend")
+    args.usb_h264_rate_control_from_cli = option_present(raw_args, "--usb-h264-rate-control")
     args.usb_h264_ffmpeg_encoder_from_cli = option_present(raw_args, "--usb-h264-ffmpeg-encoder")
     if args.fps is None:
         args.fps = DEFAULT_FPS
@@ -2638,6 +2667,7 @@ def main(*, exit_on_error: bool = True) -> None:
             args.cluster_hud_encoder,
             args.language,
             args.is_metric,
+            usb_h264_ffmpeg_threads=args.usb_h264_ffmpeg_threads,
         )
     except KeyboardInterrupt:
         print("\nStopped.")
