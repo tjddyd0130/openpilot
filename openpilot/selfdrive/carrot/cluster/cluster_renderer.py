@@ -18,6 +18,7 @@ from openpilot.common.transformations.camera import DEVICE_CAMERAS, view_frame_f
 from openpilot.common.transformations.orientation import rot_from_euler
 from openpilot.selfdrive.carrot.deceleration_source import navigation_status_presentation
 from openpilot.selfdrive.carrot.signal_display import SignalDisplayReader, project_box
+from openpilot.selfdrive.carrot.lead_brake_lights import BrakeDisplayReader
 
 from cluster_gles_dmabuf import DirectNv12DmabufError, create_tici_nv12_dmabuf_pool
 from cluster_gles_readback import DirectNv12ReadbackError, create_tici_direct_readback
@@ -48,6 +49,7 @@ from cluster_config import (
     CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
     CLUSTER_SCREEN_MODE_FULLSCREEN_3D,
     CLUSTER_SCREEN_MODE_NAVI,
+    CLUSTER_SCREEN_MODE_NAV_MODEL,
     CLUSTER_SCREEN_MODE_TRIP_REPORT,
     CLUSTER_SCREEN_MODE_DEFAULT,
     CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
@@ -922,6 +924,10 @@ class ClusterUiRenderer:
         self.is_metric = bool(is_metric)
         self._theme = current_cluster_theme(self.theme_mode)
         self.hidden = False
+        self._nav_model_texture = None
+        self._nav_model_checked = 0.
+        self._nav_model_mtime = 0
+        self._nav_model_fresh = False
         self._window_open = False
         self._font = None
         self._owns_font = False
@@ -976,6 +982,7 @@ class ClusterUiRenderer:
         self._live_road_camera = None
         self._live_road_camera_failed = False
         self._signal_display_reader = SignalDisplayReader()
+        self._brake_display_reader = BrakeDisplayReader()
         self._camera_overlay_wide = False
         self._left_turn_signal_started_at: float | None = None
         self._right_turn_signal_started_at: float | None = None
@@ -1055,6 +1062,7 @@ class ClusterUiRenderer:
         return getattr(self, "screen_mode", CLUSTER_SCREEN_MODE_DEFAULT) not in (
             CLUSTER_SCREEN_MODE_DEBUG_GRAPH,
             CLUSTER_SCREEN_MODE_NAVI,
+            CLUSTER_SCREEN_MODE_NAV_MODEL,
         )
 
     def _driving_panel_offset_design_x(self) -> float:
@@ -1202,6 +1210,10 @@ class ClusterUiRenderer:
             rl.set_config_flags(flags)
         profile_stage = self._profile_start()
         rl.init_window(self.width, self.height, self.title)
+        # Own the context before font/model setup can fail or be interrupted.
+        self._window_open = rl.is_window_ready()
+        if not self._window_open:
+            raise RuntimeError("HUD graphics window initialization failed")
         self._profile_add("renderer.open.init_window", profile_stage)
         if self.target_fps > 0:
             profile_stage = self._profile_start()
@@ -1224,6 +1236,19 @@ class ClusterUiRenderer:
         self._profile_add("renderer.open.total", profile_total)
 
     def close(self) -> None:
+        try:
+            self._close_resources()
+        finally:
+            if self._window_open:
+                try:
+                    rl.close_window()
+                finally:
+                    self._window_open = False
+
+    def _close_resources(self) -> None:
+        if self._nav_model_texture is not None:
+            rl.unload_texture(self._nav_model_texture)
+            self._nav_model_texture = None
         self._system_stats.close()
         if not self._window_open:
             return
@@ -1340,8 +1365,6 @@ class ClusterUiRenderer:
         self._camera_overlay_strip_pair_visibility = bytearray()
         self._route_video_size = None
         self._route_video_frame_id = None
-        rl.close_window()
-        self._window_open = False
 
     def should_close(self) -> bool:
         return bool(self._window_open and rl.window_should_close())
@@ -1496,8 +1519,45 @@ class ClusterUiRenderer:
         self._draw_hud(state, signal_lights)
         self._profile_add("render.hud", profile_stage)
         profile_stage = self._profile_start()
+        from openpilot.common.indicator_display import draw as draw_indicator
+        draw_indicator(530, 78, 460, self._korean_font or self._font, 24)
         self._draw_alert_overlay(getattr(state, "alert", None))
         self._profile_add("render.alert", profile_stage)
+
+    def _draw_nav_model_map(self):
+        from openpilot.selfdrive.navigation.preview import PREVIEW_PATH, preview_fresh
+        # Mode 7 keeps the normal driving view/HUD on the left. The map uses
+        # only the existing right information panel, including in 3D views.
+        rl.draw_rectangle(NAVI_LIVE_PANEL_X, 0, NAVI_LIVE_PANEL_W, DESIGN_HEIGHT, rl.BLACK)
+        center_x = NAVI_LIVE_PANEL_X + NAVI_LIVE_PANEL_W / 2
+        now = time.monotonic()
+        if now >= self._nav_model_checked:
+            self._nav_model_checked = now + .5
+            self._nav_model_fresh = preview_fresh()
+            if self._nav_model_fresh:
+                try:
+                    mtime = PREVIEW_PATH.stat().st_mtime_ns
+                    if mtime != self._nav_model_mtime:
+                        texture = rl.load_texture(str(PREVIEW_PATH))
+                        if texture.id:
+                            if self._nav_model_texture is not None:
+                                rl.unload_texture(self._nav_model_texture)
+                            self._nav_model_texture = texture
+                            self._nav_model_mtime = mtime
+                        else:
+                            self._nav_model_fresh = False
+                except OSError:
+                    self._nav_model_fresh = False
+        if self._nav_model_fresh and self._nav_model_texture is not None:
+            size = min(DESIGN_HEIGHT - 80, NAVI_LIVE_PANEL_W - 32)
+            rl.draw_texture_pro(self._nav_model_texture, rl.Rectangle(0, 0, 256, 256),
+                                rl.Rectangle(center_x - size / 2, 20, size, size),
+                                rl.Vector2(0, 0), 0, rl.WHITE)
+            self._draw_text("Mapbox / Protomaps | (c) OpenStreetMap", center_x,
+                            DESIGN_HEIGHT - 40, 14, (180, 180, 180), "center")
+        else:
+            self._draw_text("NAV MAP: waiting for route / GPS / tiles", center_x,
+                            DESIGN_HEIGHT / 2, 24, (255, 255, 255), "center")
 
     def _prepare_trip_report_cache(self, state: ClusterUiState, now: float | None = None) -> None:
         """Refresh the expensive trip-report panel outside the active frame target."""
@@ -1655,6 +1715,16 @@ class ClusterUiRenderer:
             rl.end_scissor_mode()
 
     def _draw_signal_detections(self, projection, live_camera) -> None:
+        brake = self._brake_display_reader.read(live_camera.display_frame)
+        if brake is not None:
+            video = projection.video_dest
+            if brake.get('box') is not None:
+                x, y, w, h = project_box(brake['box'], (video.x, video.y, video.width, video.height))
+                color = (255, 100, 40) if brake['state'] == 'candidate' else (180, 180, 180)
+                rl.draw_rectangle_lines_ex(rl.Rectangle(x-2, y-2, w+4, h+4), 2., rl_color(color))
+                label = 'BRAKE?' if brake['state'] == 'candidate' else 'BRK?'
+                self._draw_text_with_stroke(label, x, max(projection.dest.y+20, y-15),
+                                            max(14., self.height / DESIGN_HEIGHT * 17.), color, (0, 0, 0), 2)
         reader = self._signal_display_reader
         tracks = reader.read(live_camera.display_frame)
         if not reader.enabled:
@@ -1687,6 +1757,13 @@ class ClusterUiRenderer:
             caption += " · ~ 이전 판독" if self.language == CLUSTER_LANGUAGE_KO else ' · ~ PREVIOUS'
         if live_camera.is_wide:
             caption = "신호 관찰: 일반 카메라에서 표시" if self.language == CLUSTER_LANGUAGE_KO else 'SIGNAL VIEW: ROAD CAMERA ONLY'
+        from openpilot.selfdrive.carrot.signal_display import signal_display_status
+        color, held, online = signal_display_status()
+        result = ('?', 'R', 'G', 'R+G')[color]
+        status = ('이전 판독' if held else '판독 중' if online else '입력 대기') if self.language == CLUSTER_LANGUAGE_KO else ('PREVIOUS' if held else 'LIVE' if online else 'WAITING')
+        caption += f' | {result} {status}'
+        if brake is not None:
+            caption += ' | BRAKE?' if brake['state'] == 'candidate' else ' | BRK ?'
         self._draw_text_with_stroke(caption, dest.x+12, dest.y+font_size, font_size,
                                     (230, 230, 230), (0, 0, 0), 2)
         reader.record_draw(live_camera.display_frame, visible)
@@ -3137,6 +3214,7 @@ class ClusterUiRenderer:
             CLUSTER_SCREEN_MODE_DEBUG_SYSTEM,
             CLUSTER_SCREEN_MODE_DEBUG_GRAPH_RIGHT,
             CLUSTER_SCREEN_MODE_TRIP_REPORT,
+            CLUSTER_SCREEN_MODE_NAV_MODEL,
         ):
             return NAVI_WORLD_VIEW_SHIFT_X * self.width / DESIGN_WIDTH
         if screen_mode != CLUSTER_SCREEN_MODE_DEFAULT:
@@ -3867,6 +3945,11 @@ class ClusterUiRenderer:
         self._profile_add("hud.push_scale", profile_stage)
         try:
             screen_mode = self._effective_screen_mode(state)
+            if screen_mode == CLUSTER_SCREEN_MODE_NAV_MODEL:
+                self._draw_driving_hud_content(state, screen_mode, left_signal_lit, right_signal_lit)
+                self._draw_nav_model_map()
+                self._draw_status_footer(state)
+                return
             if screen_mode == CLUSTER_SCREEN_MODE_NAVI:
                 self._draw_navi_dashboard(state)
                 self._draw_status_footer(state)
@@ -7214,6 +7297,15 @@ class ClusterUiRenderer:
         )
 
     def _draw_model_traffic_state(self, traffic_state: int) -> None:
+        from openpilot.selfdrive.carrot.signal_display import signal_display_status, display_requested
+        if display_requested():
+            color, held, _ = signal_display_status()
+            rgb = ((160, 165, 170), (255, 75, 75), (60, 255, 120), (255, 185, 40))[color]
+            if held:
+                rgb = tuple(int(c*.55) for c in rgb)
+            for offset in (2, 3, 4):
+                rl.draw_circle_lines(int(SPEED_MODEL_TRAFFIC_CENTER_X), int(SPEED_MODEL_TRAFFIC_CENTER_Y),
+                                     SPEED_MODEL_TRAFFIC_ICON_SIZE*.5+offset, rl_color(rgb))
         if traffic_state not in (1, 2):
             return
         red_light = traffic_state == 1

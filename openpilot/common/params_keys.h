@@ -157,7 +157,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"TrafficLight", {CLEAR_ON_MANAGER_START, STRING} },
 
     {"ApiCache_NavDestinations", {PERSISTENT, STRING}},
-    {"NavDestination", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
+    {"NavDestination", {PERSISTENT, STRING}},
+    {"NavDestinationTemporary", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION | DONT_LOG, STRING}},
     {"NavDestinationWaypoints", {CLEAR_ON_MANAGER_START | CLEAR_ON_OFFROAD_TRANSITION, STRING}},
     {"NavPastDestinations", {PERSISTENT, STRING}},
     {"NavSettingLeftSide", {PERSISTENT, BOOL}},
@@ -233,6 +234,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoCurveSpeedFactor", {PERSISTENT, INT, "120"}},
 
     {"AutoTurnControl", {PERSISTENT, INT, "0"}},
+    {"AutoTurnControlRightLaneChange", {PERSISTENT, INT, "0"}},
+    {"ManualLaneChangeIndicator", {PERSISTENT, BOOL, "0"}},
+    {"ModelDesireIndicator", {PERSISTENT, BOOL, "0"}},
+    {"ModelPathIndicator", {PERSISTENT, BOOL, "0"}},
     {"AutoTurnControlSpeedTurn", {PERSISTENT, INT, "20"}},
     {"AutoTurnControlTurnEnd", {PERSISTENT, INT, "6"}},
     {"AutoTurnMapChange", {PERSISTENT, INT, "0"}},
@@ -242,6 +247,13 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"AutoNaviSpeedCtrlMode", {PERSISTENT, INT, "2"}},
     {"VehicleNaviCanControl", {PERSISTENT, INT, "0"}},
     {"VehicleNaviSchoolZoneControl", {PERSISTENT, BOOL, "0"}},
+    {"VehicleNaviDecelCancel", {PERSISTENT, BOOL, "0"}},
+    {"VehicleNaviDecelCancelBox", {PERSISTENT, BOOL, "1"}},
+    {"VehicleNaviDecelCancelMobileZone", {PERSISTENT, BOOL, "1"}},
+    {"VehicleNaviDecelCancelBump", {PERSISTENT, BOOL, "1"}},
+    {"VehicleNaviDecelCancelUnknown", {PERSISTENT, BOOL, "0"}},
+    {"VehicleNaviDecelCancelEarlyWarning", {PERSISTENT, BOOL, "0"}},
+    {"VehicleNaviSectionAvgControl", {PERSISTENT, BOOL, "0"}},
     {"VehicleSpeedCameraControlMode", {PERSISTENT, INT, "1"}},
     {"VehicleSpeedCameraDistanceTime", {PERSISTENT, INT, "60"}},
     {"AutoRoadSpeedLimitOffset", {PERSISTENT, INT, "-1"}},
@@ -280,8 +292,11 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"MyDrivingModeAuto", {PERSISTENT, INT, "0"}},
     {"TrafficLightDetectMode", {PERSISTENT, INT, "2"}},
     {"SignalAssistMode", {PERSISTENT, INT, "0"}},
+    {"LeadBrakeLights", {PERSISTENT, BOOL, "0"}},
 
     {"SteerActuatorDelay", {PERSISTENT, INT, "0"}},
+    {"CenterToFrontRatioEnabled", {PERSISTENT, BOOL}},  // Retired: migration only
+    {"CenterToFrontRatio", {PERSISTENT, INT, "0"}},
     {"LatSmoothSec", {PERSISTENT, INT, "13"}},
     {"LatSuspendAngleDeg", {PERSISTENT, INT, "300"}},
     {"CruiseOnDist", {PERSISTENT, INT, "400"}},
@@ -317,6 +332,8 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"FingerPrints", {PERSISTENT | CLEAR_ON_MANAGER_START, STRING}},
     {"IsLdwsCar", {PERSISTENT, INT, "0"}},
     {"CanfdHDA2", {PERSISTENT, INT, "0"}},
+    {"CanfdBlinkerControl", {PERSISTENT, BOOL, "0"}},
+    {"CanfdBlinkerTest", {CLEAR_ON_MANAGER_START, INT, "0"}},
     {"CanfdDebug", {PERSISTENT, INT, "0"}},
 
     {"SoundVolumeAdjust", {PERSISTENT, INT, "100"}},
@@ -349,6 +366,9 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"LaneChangeDelay", {PERSISTENT, INT, "0"}},
     {"LaneChangeBsd", {PERSISTENT, INT, "0"}},
     {"LaneLineCheck", {PERSISTENT, INT, "0"}},
+    {"AutoBlinkerControl", {PERSISTENT, INT, "0"}},
+    {"BlinkerLatchedTurn", {PERSISTENT, INT, "0"}},
+    {"LaneChangeLeverWait", {PERSISTENT, BOOL, "0"}},
     {"MaxAngleFrames", {PERSISTENT, INT, "89"}},
 
     {"LatMpcPathCost", {PERSISTENT, INT, "200"}},
@@ -378,6 +398,7 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"SpeedFromPCM", {PERSISTENT, INT, "2"}},
     {"MaxTimeOffroadMin", {PERSISTENT, INT, "60"}},
     {"TeslaWakeOnCAN", {PERSISTENT, BOOL, "1"}},
+    {"TeslaAutoTurnSignals", {PERSISTENT, BOOL, "0"}},
 
     {"DisableDM", {PERSISTENT, INT, "0"}},  // retired; read only for one-time streaming migration
     {"DriverMonitoringEnabled", {PERSISTENT, BOOL, "1"}},
@@ -408,8 +429,10 @@ inline static std::unordered_map<std::string, ParamKeyAttributes> keys = {
     {"NNFFLite", {PERSISTENT, INT, "0"}},
     {"NNFFModelName", {CLEAR_ON_OFFROAD_TRANSITION, STRING}},
 
+    {"CommaPedalEnabled", {PERSISTENT, INT, "0"}},
     {"HardwareC3xLite", {PERSISTENT, INT, "0"}},
     {"ShareData", {PERSISTENT, INT, "0"}},
+    {"OnnxBsdEnabled", {PERSISTENT, INT, "0"}},
     {"OnnxLaneThreshold", {PERSISTENT, INT, "25"}},
     {"OnnxLaneIntervalMs", {PERSISTENT, INT, "400"}},
     {"OnnxBsdThreshold", {PERSISTENT, INT, "94"}},

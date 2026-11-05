@@ -1,6 +1,8 @@
 from openpilot.selfdrive.carrot import cluster_autorun
 
 
+
+
 def test_device_cluster_uses_standalone_carrot_navi_ipc():
   args = cluster_autorun._cluster_args(
     hud_mode=1,

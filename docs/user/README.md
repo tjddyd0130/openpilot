@@ -6,6 +6,7 @@
 
 | 주제 | 한국어 | English |
 |---|---|---|
+| 깜빡이 제어 장치 | [지원 목록·사진·설치](ko/indicator-adapters.md) | [Supported adapters and installation](en/indicator-adapters.md) |
 | Carrot Web | [Carrot Web 사용 설명서](ko/carrot-web.md) | [Carrot Web User Guide](en/carrot-web.md) |
 | 분석 로그 전송 | [분석용 대시캠 로그 전송](ko/dashcam-log-sharing.md) | [Sending Dashcam Logs for Analysis](en/dashcam-log-sharing.md) |
 | 설정 | [설정 이해하기](ko/settings.md) | [Understanding Settings](en/settings.md) |
@@ -15,6 +16,8 @@
 | 크루즈·차간거리 | [크루즈·차간거리](ko/cruise-gap.md) | [Cruise and Following Gap](en/cruise-gap.md) |
 | 레이더 | [레이더트랙·코너레이더](ko/radar.md) | [Radar Tracks and Corner Radar](en/radar.md) |
 | Tesla | [Tesla 차량 연동](ko/tesla.md) | [Tesla Vehicle Integration](en/tesla.md) |
+
+中文补充指南：[特斯拉车辆集成与使用指南](zh/tesla.md)。结合英文、韩文与当前代码，覆盖车型、控制模式、扩展 CAN、自动限速、自动转向灯及验证边界。
 
 ## 코드 변경 시 문서 확인
 
@@ -41,3 +44,5 @@ Docs-Not-Needed: 사용자 동작은 동일하며 내부 함수만 분리함
 ## English policy summary
 
 Every public user document has a Korean and English file with the same name. A user-visible code change must update both files in the same change. The documentation checker accepts a topic only when one complete `ko`/`en` pair from `docs_map.json` changed. Internal-only or non-public material must not be added here.
+
+The [Chinese Tesla guide](zh/tesla.md) supplements the existing Korean/English pair, without changing the checker contract. Keep its supported features and limitations aligned when updating Tesla guidance.

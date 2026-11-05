@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import unittest
 
+import numpy as np
+
 from opendbc.car.structs import CarParams
 from opendbc.car.tesla.values import TeslaSafetyFlags
 from opendbc.can import CANDefine
@@ -103,6 +105,55 @@ class TestTeslaSafetyBase(common.PandaCarSafetyTest, common.AngleSteeringSafetyT
     self._common_measurement_test(self._speed_msg, 0, 285 / 3.6, 1,
                                   self.safety.get_vehicle_speed_min, self.safety.get_vehicle_speed_max)
 
+  def test_inactive_angle_requires_clamped_measurement(self):
+    for controls_allowed in (True, False):
+      self.safety.set_controls_allowed(controls_allowed)
+      for measured in (-420.0, -360.0, -12.3, 12.3, 360.0, 420.0):
+        with self.subTest(controls_allowed=controls_allowed, measured=measured):
+          self._reset_angle_measurement(measured)
+          inactive = max(-self.STEER_ANGLE_MAX, min(self.STEER_ANGLE_MAX, measured))
+          self.assertTrue(self._tx(self._angle_cmd_msg(inactive, False)))
+          for offset in (-1.0, 1.0):
+            self.assertFalse(self._tx(self._angle_cmd_msg(inactive + offset, False)))
+
+  def test_angle_cmd_when_disabled(self):
+    # Carrot permits lateral control independently of stock cruise. NONE still must follow the measured angle.
+    for controls_allowed in (True, False):
+      for steer_control_enabled in (True, False):
+        for angle_meas in range(-90, 91, 10):
+          self._reset_angle_measurement(angle_meas)
+          for angle_cmd in range(-90, 91, 10):
+            self.safety.set_controls_allowed(controls_allowed)
+            self._set_prev_desired_angle(angle_cmd)
+            should_tx = steer_control_enabled or angle_cmd == angle_meas
+            self.assertEqual(should_tx, self._tx(self._angle_cmd_msg(angle_cmd, steer_control_enabled)),
+                             f"{controls_allowed=}, {steer_control_enabled=}, {angle_meas=}, {angle_cmd=}")
+            self.assertEqual(self.safety.get_controls_allowed(), controls_allowed)
+
+  def test_angle_rate_limits_without_cruise_permission(self):
+    for speed in (0., 1., 5., 10., 25., 50.):
+      self._reset_speed_measurement(speed)
+      up = np.interp(speed, self.ANGLE_RATE_BP, self.ANGLE_RATE_UP)
+      down = np.interp(speed, self.ANGLE_RATE_BP, self.ANGLE_RATE_DOWN)
+      for angle in (-90., 0., 90.):
+        self._reset_angle_measurement(angle)
+        sign = -1 if angle < 0 else 1
+        for delta, allowed in ((sign * up, True), (-sign * down, True),
+                               (max(up, down) + 1.1, False), (-max(up, down) - 1.1, False)):
+          with self.subTest(speed=speed, angle=angle, delta=delta):
+            self.safety.set_controls_allowed(False)
+            self._set_prev_desired_angle(angle)
+            self.assertEqual(self._tx(self._angle_cmd_msg(angle + delta, True)), allowed)
+            self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_lateral_without_cruise_never_grants_longitudinal_permission(self):
+    self.safety.set_controls_allowed(False)
+    self._reset_angle_measurement(0.)
+    self._set_prev_desired_angle(0.)
+    self.assertTrue(self._tx(self._angle_cmd_msg(0., True)))
+    self.assertFalse(self._tx(self._accel_msg(1.0)))
+    self.assertFalse(self.safety.get_controls_allowed())
+
 
 class TestTeslaStockSafety(TestTeslaSafetyBase):
 
@@ -139,6 +190,55 @@ class TestTeslaLongitudinalSafety(TestTeslaSafetyBase):
   def test_no_aeb(self):
     for aeb_event in range(4):
       self.assertEqual(self._tx(self._long_control_msg(10, aeb_event=aeb_event)), aeb_event == 0)
+
+  def test_acceleration_tx_never_grants_controls(self):
+    for flags in (1, 3, 5, 7):
+      for accel in (0.0, 1.0, -1.0, 2.1, -3.6):
+        with self.subTest(flags=flags, accel=accel):
+          self.safety.set_safety_hooks(CarParams.SafetyModel.tesla, flags)
+          self.safety.init_tests()
+          self.safety.set_controls_allowed(False)
+          self.assertEqual(self._tx(self._accel_msg(accel)), accel == 0.0)
+          self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_permission_loss_blocks_actuation_without_tx_reengagement(self):
+    for cause in ("cruise", "brake", "gas"):
+      with self.subTest(cause=cause):
+        self._reset_safety_hooks()
+        self.safety.init_tests()
+        self.assertTrue(self._rx(self._pcm_status_msg(True)))
+        self.assertTrue(self.safety.get_controls_allowed())
+        self.assertTrue(self._tx(self._accel_msg(1.0)))
+        if cause == "cruise":
+          self.assertTrue(self._rx(self._pcm_status_msg(False)))
+        elif cause == "brake":
+          self.assertTrue(self._rx(self._user_brake_msg(True)))
+        else:
+          self.assertTrue(self._rx(self._user_gas_msg(10)))
+        self.assertFalse(self._tx(self._accel_msg(1.0)))
+        self.assertTrue(self._tx(self._accel_msg(0.0)))
+        if cause != "gas":
+          self.assertFalse(self.safety.get_controls_allowed())
+
+  def test_each_acceleration_bound_requires_permission_and_valid_range(self):
+    for enabled in (False, True):
+      self.safety.set_controls_allowed(enabled)
+      for minimum, maximum in ((0, 0), (-1, 0), (0, 1), (-3.48, 2), (-3.6, 0), (0, 2.1), (2.1, 0), (0, -3.6)):
+        with self.subTest(enabled=enabled, minimum=minimum, maximum=maximum):
+          valid_range = self.MIN_ACCEL <= minimum <= self.MAX_ACCEL and self.MIN_ACCEL <= maximum <= self.MAX_ACCEL
+          inactive = minimum == maximum == 0
+          self.assertEqual(self._tx(self._long_control_msg(10, accel_limits=(minimum, maximum))),
+                           valid_range and (enabled or inactive))
+          self.assertEqual(self.safety.get_controls_allowed(), enabled)
+
+  def test_stock_aeb_still_blocks_host_commands(self):
+    self.safety.set_controls_allowed(True)
+    self.assertTrue(self._tx(self._accel_msg(1.0)))
+    self.assertTrue(self._rx(self._long_control_msg(10, aeb_event=1, bus=2)))
+    self.assertFalse(self._tx(self._accel_msg(1.0)))
+    self.assertFalse(self._tx(self._accel_msg(0.0)))
+    self.assertTrue(self._rx(self._long_control_msg(10, aeb_event=0, bus=2)))
+    self.assertTrue(self._tx(self._accel_msg(1.0)))
 
   def test_stock_aeb_passthrough(self):
     no_aeb_msg = self._long_control_msg(10, aeb_event=0)

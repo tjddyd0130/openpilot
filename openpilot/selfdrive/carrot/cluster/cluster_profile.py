@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 import gc
 import os
+import sys
 import time
 from typing import Any
 
@@ -205,16 +206,54 @@ class GcProfileHook:
             self.profile.add(f"gc.gen{generation}", (time.perf_counter() - start_time) * 1000.0)
 
 
-def freeze_gc_after_init(profile: ProfileReporter) -> None:
+def freeze_gc_after_init(profile: ProfileReporter) -> tuple[int, int, int] | None:
     freeze = getattr(gc, "freeze", None)
     if freeze is None:
         return
 
+    previous_thresholds = gc.get_threshold()
     profile_stage = time.perf_counter()
     gc.collect(2)
     profile.add_elapsed("gc.freeze_init.collect", profile_stage)
 
     profile_stage = time.perf_counter()
+    _trim_unused_heap()
+    profile.add_elapsed("gc.freeze_init.trim", profile_stage)
+
+    profile_stage = time.perf_counter()
     freeze()
     profile.add_elapsed("gc.freeze_init.freeze", profile_stage)
     gc.set_threshold(*_post_freeze_gc_thresholds())
+    return previous_thresholds
+
+
+def restore_gc_after_run(previous_thresholds: tuple[int, int, int] | None) -> None:
+    if previous_thresholds is None:
+        return
+    # A failed JPEG worker keeps a traceback cycle through its frozen pipeline.
+    # Autorun collects after this session's stack and exception handler unwind,
+    # while preserving freeze during the active frame loop.
+    gc.unfreeze()
+    gc.set_threshold(*previous_thresholds)
+
+
+def _trim_unused_heap() -> None:
+    """Return freed native image/encoder scratch pages at inactive boundaries."""
+    if sys.platform != "linux":
+        return
+    import ctypes
+
+    try:
+        trim = ctypes.CDLL(None).malloc_trim
+    except (AttributeError, OSError):
+        return  # Non-glibc platforms still benefit from normal collection.
+    trim.argtypes = [ctypes.c_size_t]
+    trim.restype = ctypes.c_int
+    trim(0)
+
+
+def release_finished_session_memory() -> None:
+    # The caller must have left the renderer and its exception handler. While
+    # those frames are live, traceback cycles still own their session objects.
+    gc.collect(2)
+    _trim_unused_heap()

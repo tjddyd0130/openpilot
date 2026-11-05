@@ -81,6 +81,14 @@ def _is_usb_disconnect_error(exc: BaseException) -> bool:
     return False
 
 
+def _report_cluster_failure(exc: BaseException) -> None:
+    if _is_usb_disconnect_error(exc):
+        print(f"[cluster_autorun] USB display disconnected; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
+    else:
+        print(f"[cluster_autorun] cluster HUD failed: {exc}; retrying in {RETRY_INTERVAL_S:.0f}s", flush=True)
+        traceback.print_exc()
+
+
 def _read_hud_mode(params: Params) -> int:
     try:
         return int(params.get_int(HUD_PARAM))
@@ -186,6 +194,8 @@ def _run_cluster_once(
     usbgpu_active: bool = False,
 ) -> None:
     from selfdrive.carrot import cluster_run
+    # Install before renderer/encoder dependencies can bind graphics symbols.
+    cluster_run.configure_cluster_graphics()
     from cluster_h264_pipeline import H264PipelineInitializationError
 
     def run_cluster_entry() -> None:
@@ -406,10 +416,8 @@ def _turn_off_supported_usb_device(expected_product_id: int, reason: str) -> boo
     _configure_autorun_locale()
 
     from cluster_usb_display import TuringUsbDisplay, find_supported_usb_product, product_label
-
     if find_supported_usb_product(expected_product_id) is None:
         return False
-
     display = TuringUsbDisplay(brightness=0, display_fps=0, expected_product_id=expected_product_id)
     try:
         display.open()
@@ -534,6 +542,9 @@ def main() -> None:
     drop_realtime()
     _configure_autorun_locale()
     _ensure_cluster_paths()
+    from cluster_graphics_cleanup import ensure_clean_autorun_process
+    ensure_clean_autorun_process()
+    from cluster_profile import release_finished_session_memory
     from cluster_usb_display import find_supported_usb_product, product_id_for_hud_mode, product_label
 
     scheduler = DisplayScheduler(4, enabled=TICI)
@@ -575,8 +586,10 @@ def main() -> None:
                         flush=True,
                     )
                     traceback.print_exc()
-                    time.sleep(RETRY_INTERVAL_S)
-                    continue
+                finally:
+                    release_finished_session_memory()
+                time.sleep(RETRY_INTERVAL_S)
+                continue
             found_product_id = _wait_for_supported_usb_device(
                 params,
                 expected_product_id,
@@ -615,17 +628,13 @@ def main() -> None:
                 flush=True,
             )
         except Exception as exc:
-            if _is_usb_disconnect_error(exc):
-                print(
-                    f"[cluster_autorun] USB display disconnected; retrying in {RETRY_INTERVAL_S:.0f}s",
-                    flush=True,
-                )
-            else:
-                print(
-                    f"[cluster_autorun] cluster HUD failed: {exc}; retrying in {RETRY_INTERVAL_S:.0f}s",
-                    flush=True,
-                )
-                traceback.print_exc()
+            _report_cluster_failure(exc)
+        finally:
+            # run_demo unfreezes on exit. Collect only after its stack and the
+            # handled exception are gone, before another renderer allocates.
+            # Otherwise failed pipeline traceback cycles survive the retry wait
+            # and overlap the next session until its late initialization GC.
+            release_finished_session_memory()
         time.sleep(RETRY_INTERVAL_S)
 
 

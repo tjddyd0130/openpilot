@@ -566,6 +566,12 @@ def create_acc_control_scc2(packer, CAN, enabled, accel_value_last, accel, stopp
   values["ZEROS_7"] = 0 if stop_controller is not None else 1
   apply_canfd_stopping(values, CS, stop_controller, accel, previous_value, jerk_u, jerk_l)
 
+  # Trial for no-lead stops: OEM SCC_ObjSta is named HUD_LEAD_INFO in this DBC.
+  # Change only the state after the final StopReq/interlocks; do not fabricate
+  # object distance/speed or latch it into RX. This is not a confirmed ESC gate.
+  if stop_controller is not None and values["ACCMode"] == 1 and values["StopReq"] == 1 and values["HUD_LEAD_INFO"] == 0:
+    values["HUD_LEAD_INFO"] = 2
+
   return packer.make_can_msg("SCC_CONTROL", CAN.ECAN, values), values["aReqValue"]
 
 def create_acc_control(packer, CAN, enabled, accel_last, accel, stopping, gas_override, set_speed, hud_control, jerk_u, jerk_l, CS,
@@ -773,6 +779,56 @@ def _get_desire_and_lane_changing(md):
       if ds[4] > 0.9: lane_changing = 4
   return desire, lane_changing
 
+BLINK_HOLD_CROSS_NEAR_M = 1.0     # the target-side line came this close to the car centre ...
+BLINK_HOLD_CROSS_JUMP_M = 1.5     # ... then moved this far away again: the model relabelled it, the centre is across
+BLINK_HOLD_RELEASE_PROGRESS = 0.6  # release once the car centre has moved this fraction of a lane width into the new lane
+
+
+def _blink_hold_side(md, desire, state):
+  """Turn-signal hold for ADRV_0x1ea: 3 (left), 4 (right) or 0.
+
+  DesireHelper's request (modelV2.meta.laneChangeBlinkerHold) wins: it holds the lamp while a lever-requested
+  change waits (LaneChangeLeverWait) and while a next change asked for during this one is queued. Otherwise the
+  current change decides (_blink_hold_change).
+  """
+  change_hold = _blink_hold_change(md, desire, state)
+  meta = getattr(md, "meta", None) if md is not None else None
+  requested = str(getattr(meta, "laneChangeBlinkerHold", "none"))
+  return 3 if requested == "left" else 4 if requested == "right" else change_hold
+
+
+def _blink_hold_change(md, desire, state):
+  """Hold for the current lane change: 3 (left), 4 (right) or 0.
+
+  Held for the whole confirmed lane change (desire 3/4 = starting + finishing, same as the green
+  cluster lane) instead of the model's desireState > 0.9, which falls ~2 s before the change ends and
+  let the lamp stop mid-change (2026-09-19 drive: hold covered 49-65 % of the change). Released once the
+  model's lane lines show the car centre 60 % of a lane width over (the crossed line, now on the other
+  side, 0.1 lane width away), so the lamp does not keep flashing ~2 s after the car is already in the new
+  lane. Without a detectable crossing the hold lasts to the end of the desire.
+  """
+  if desire not in (3, 4):
+    state.update(crossed=False, released=False, y_min=None)
+    return 0
+  if state.get("released"):
+    return 0
+  lines = getattr(md, "laneLines", None) if md is not None else None
+  if lines is not None and len(lines) >= 3 and len(lines[1].y) and len(lines[2].y):
+    target, other = (1, 2) if desire == 3 else (2, 1)
+    y_target, y_other = float(lines[target].y[0]), float(lines[other].y[0])
+    # The relabel is spread over 2-3 model frames (e.g. -0.28 -> -1.36 -> -3.46 m), so compare with the
+    # closest approach instead of the previous frame.
+    y_min = abs(y_target) if state.get("y_min") is None else min(state["y_min"], abs(y_target))
+    state["y_min"] = y_min
+    if not state.get("crossed") and y_min < BLINK_HOLD_CROSS_NEAR_M and abs(y_target) - y_min > BLINK_HOLD_CROSS_JUMP_M:
+      state["crossed"] = True
+    lane_width = abs(y_target) + abs(y_other)
+    if state.get("crossed") and abs(y_other) >= (BLINK_HOLD_RELEASE_PROGRESS - 0.5) * lane_width:
+      state["released"] = True
+      return 0
+  return desire
+
+
 def _apply_lane_desire(values, desire):
   #values['LANE_CHANGING'] = 0
 
@@ -873,7 +929,7 @@ def _apply_ccnc_lead(values, radar_state, enabled, model_v2=None, hud_lateral=No
   values["FF_LATERAL"] = clip_float(lateral if hud_lateral is None else hud_lateral, -6.4, 6.3)
 
 
-def create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping):
+def create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping, *, keep_stock_scc_main=False):
   # This is a button request for Panda, not a replacement vehicle frame.
   # Panda overlays it on fresh 0x10B input, retaining all unknown fields,
   # the received counter, and the vehicle's original transmission cadence.
@@ -886,14 +942,14 @@ def create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping):
     if lfa_off and 0 < frame % 200 < 12:
       lfa_button = 1
 
-    if CC.enabled and not longitudinal_interlock_active(CS) and not lfa_button:
+    if (CC.enabled or keep_stock_scc_main) and not longitudinal_interlock_active(CS) and not lfa_button:
       # Leave a release interval after the LFA pulse before requesting SCC.
       scc_pulse = 20 < frame % 200 <= 26 and CS.out.vEgo > 3.
       if not CS.MainMode_ACC:
         cruise_button = 8 if scc_pulse else 0
-      elif CS.ACCMode in (0, 4):
+      elif CC.enabled and CS.ACCMode in (0, 4):
         cruise_button = 2 if scc_pulse else 0
-      elif CS.scc_control is not None and CS.scc_control["InfoDisplay"] == 4 and not stopping:
+      elif CC.enabled and CS.scc_control is not None and CS.scc_control["InfoDisplay"] == 4 and not stopping:
         cruise_button = 2 if 10 < frame % 30 <= 16 else 0
       # Do not toggle MAIN merely because HDA is off: SCC is already active.
 
@@ -918,9 +974,17 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
   if not hasattr(create_ccnc_messages, '_lane_line_check') or frame % 100 == 0:
     create_ccnc_messages._lane_line_check = Params().get_int("LaneLineCheck")
   lane_line_check = create_ccnc_messages._lane_line_check
-  desire, lane_changing = _get_desire_and_lane_changing(md)
+  desire, _ = _get_desire_and_lane_changing(md)
 
   if CP.flags & HyundaiFlags.CAMERA_SCC.value:
+    # The camera's SCC output is replaced only with openpilot longitudinal control.
+    # Keep its MAIN available for OEM display objects independently of engagement.
+    keep_stock_scc_main = (
+      getattr(CP, "openpilotLongitudinalControl", False) and enable_corner_radar > 0
+      and CS.scc_control is not None and CS.lfahda_cluster is not None
+      and CS.out.canValid and CS.out.gearShifter == "drive"
+      and math.isfinite(CS.out.vEgo) and CS.out.vEgo > 3. and not CS.out.brakePressed and not interlock_active
+    )
     HDA_CntrlModSta = 0
     HDA_LFA_SymSta = 0
     if CS.lfahda_cluster is not None:
@@ -933,11 +997,19 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
       #  ret.append(packer.make_can_msg("ADRV_0x160", CAN.ECAN, values))
 
       if getattr(CS, "cruise_buttons_alt2", None) is not None:
-        ret.append(create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping))
+        ret.append(create_alt2_adas_button_request(packer, CAN, frame, CC, CS, stopping,
+                                                  keep_stock_scc_main=keep_stock_scc_main))
       elif CS.cruise_buttons_msg is not None:
         values = copy.copy(CS.cruise_buttons_msg)
         # Keep the physical long press on ECAN for CarState, but don't forward it to CAM.
         values["NORMAL_CRUISE_MAIN_BTN"] = 0
+
+        driver_pressed = (CS.cruise_buttons_msg["LFA_BTN"] != 0 or CS.cruise_buttons_msg["CRUISE_BUTTONS"] != 0
+                          or CS.cruise_buttons_msg.get("ADAPTIVE_CRUISE_MAIN_BTN", 0) != 0
+                          or CS.cruise_buttons_msg.get("NORMAL_CRUISE_MAIN_BTN", 0) != 0)
+        if (keep_stock_scc_main and not CC.enabled and not CS.MainMode_ACC and not driver_pressed
+            and 10 < frame % 200 <= 16):
+          values["ADAPTIVE_CRUISE_MAIN_BTN"] = 1
 
         if  HDA_LFA_SymSta == 0 and 0 < frame % 200 < 12:
           values["LFA_BTN"] = 1
@@ -1086,9 +1158,13 @@ def create_ccnc_messages(CP, packer, CAN, frame, CC, CS, hud_control,
       if CS.adrv_0x1ea is not None:
         values = copy.copy(CS.adrv_0x1ea)
         rx_counter = values.pop("COUNTER", None)
-        # blinker hold
-        values['LEFT_BLINK_HOLD'] = 1 if lane_changing == 3 else 0
-        values['RIGHT_BLINK_HOLD'] = 1 if lane_changing == 4 else 0
+        # blinker hold: the confirmed lane change until the body is across (see _blink_hold_side)
+        hold = _blink_hold_side(md, desire, create_ccnc_messages.__dict__.setdefault("_blink_hold", {}))
+        external_hold = getattr(hud_control, "physicalBlinkerHold", 0)
+        if external_hold in (1, 2, 3):
+          hold = {1:0, 2:3, 3:4}[external_hold]
+        values['LEFT_BLINK_HOLD'] = 1 if hold == 3 else 0
+        values['RIGHT_BLINK_HOLD'] = 1 if hold == 4 else 0
 
         _apply_cluster_lane_lines(values, CS, lat_active, desire)
         _normalize_cluster_corner_objects(values)

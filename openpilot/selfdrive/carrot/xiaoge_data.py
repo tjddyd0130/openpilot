@@ -7,10 +7,10 @@ import struct
 import threading
 import time
 import traceback
-from typing import Any
 
 import openpilot.cereal.messaging as messaging
 from opendbc.can import CANParser
+from opendbc.car.carlog import carlog
 
 from openpilot.cereal import car
 from openpilot.common.params import Params
@@ -19,12 +19,7 @@ from openpilot.common.realtime import Ratekeeper
 
 TESLA_DAS_ROAD_ADDRESS = 605
 TESLA_AUTOPILOT_PARTY_BUS = 2
-TESLA_DAS_ROAD_TIMEOUT_S = 1.0
-
-
-def capnp_items(values, limit: int) -> list[Any]:
-  """Read a bounded prefix without slicing Cap'n Proto dynamic lists."""
-  return [values[index] for index in range(min(len(values), limit))]
+TESLA_DAS_ROAD_TIMEOUT_NS = 1_000_000_000
 
 
 class XiaogeDataBroadcaster:
@@ -44,8 +39,8 @@ class XiaogeDataBroadcaster:
     self.is_tesla = False
     self.tesla_can_sock = None
     self.tesla_can_parser = None
-    self.tesla_das_road_updated_at = 0.0
-    self.sm = messaging.SubMaster(["carState", "modelV2", "selfdriveState", "controlsState"])
+    self.tesla_das_road_updated_at = 0
+    self.tesla_traffic_status: str | None = None
 
   @staticmethod
   def get_ip_address() -> str:
@@ -145,15 +140,6 @@ class XiaogeDataBroadcaster:
         conn.close()
       self.clients.clear()
 
-  def collect_car_state(self, car_state) -> dict[str, Any]:
-    return {
-      "vEgo": max(float(car_state.vEgo), 0.0),
-      "steeringAngleDeg": float(car_state.steeringAngleDeg),
-      "leftLatDist": float(car_state.leftLatDist),
-      "leftBlindspot": bool(car_state.leftBlindspot),
-      "rightBlindspot": bool(car_state.rightBlindspot),
-    }
-
   def initialize_tesla_can(self) -> None:
     if self.car_brand_checked:
       return
@@ -165,87 +151,61 @@ class XiaogeDataBroadcaster:
     self.is_tesla = CP.brand == "tesla"
     if not self.is_tesla:
       return
-    self.tesla_can_parser = CANParser("tesla_model3_party", [("DAS_road", float("nan"))], TESLA_AUTOPILOT_PARTY_BUS)
+    self.tesla_can_parser = CANParser("tesla_modely_hw4_perception", [("APP_trafficControl", float("nan"))], TESLA_AUTOPILOT_PARTY_BUS)
     self.tesla_can_sock = messaging.sub_sock("can")
 
-  def collect_tesla_das_road(self) -> dict[str, Any] | None:
+  def _set_tesla_traffic_status(self, status: str) -> None:
+    if status != self.tesla_traffic_status:
+      if status == "valid":
+        carlog.info("Tesla traffic data available")
+      else:
+        carlog.warning(f"Tesla traffic data unavailable: {status}")
+      self.tesla_traffic_status = status
+
+  def collect_tesla_das_road(self) -> dict[str, float | int] | None:
     self.initialize_tesla_can()
     if self.tesla_can_parser is None or self.tesla_can_sock is None:
       return None
+    now = time.clock_gettime_ns(getattr(time, "CLOCK_BOOTTIME", time.CLOCK_MONOTONIC))
     for can_event in messaging.drain_sock(self.tesla_can_sock):
-      frames = [(frame.address, bytes(frame.dat), frame.src) for frame in can_event.can
-                if frame.address == TESLA_DAS_ROAD_ADDRESS and frame.src == TESLA_AUTOPILOT_PARTY_BUS]
-      if frames and TESLA_DAS_ROAD_ADDRESS in self.tesla_can_parser.update([can_event.logMonoTime, frames]):
-        self.tesla_das_road_updated_at = time.monotonic()
-    if time.monotonic() - self.tesla_das_road_updated_at > TESLA_DAS_ROAD_TIMEOUT_S:
+      timestamp = can_event.logMonoTime
+      if timestamp <= 0 or not 0 <= now - timestamp <= TESLA_DAS_ROAD_TIMEOUT_NS:
+        continue
+      if timestamp < self.tesla_das_road_updated_at:
+        continue
+      for frame in can_event.can:
+        if frame.address != TESLA_DAS_ROAD_ADDRESS or frame.src != TESLA_AUTOPILOT_PARTY_BUS:
+          continue
+        self.tesla_das_road_updated_at = timestamp
+        data = bytes(frame.dat)
+        if not 6 <= len(data) <= 8:
+          self._set_tesla_traffic_status("invalid_dlc")
+          continue
+        if TESLA_DAS_ROAD_ADDRESS not in self.tesla_can_parser.update([(timestamp, [(frame.address, data, frame.src)])]):
+          self._set_tesla_traffic_status("decode_failed")
+          continue
+        values = self.tesla_can_parser.vl["APP_trafficControl"]
+        valid = (values["APP_tcControlType"] == 3 and values["APP_tcControlLightState"] in (0, 1, 2, 3) and
+                 0 <= values["APP_tcControlDistance"] <= 200)
+        self._set_tesla_traffic_status("valid" if valid else "invalid_traffic_observation")
+    if not self.tesla_das_road_updated_at or not 0 <= now - self.tesla_das_road_updated_at <= TESLA_DAS_ROAD_TIMEOUT_NS:
+      self._set_tesla_traffic_status("stale")
       return None
-    das_road = self.tesla_can_parser.vl["DAS_road"]
+    if self.tesla_traffic_status != "valid":
+      return None
+    traffic = self.tesla_can_parser.vl["APP_trafficControl"]
     return {
-      "stopLineDist": float(das_road["DAS_stopLineDist"]),
-      "trafficLightColor": int(das_road["DAS_trafficLightColor"]),
+      "stopLineDist": float(traffic["APP_tcControlDistance"]),
+      "trafficLightColor": int(traffic["APP_tcControlLightState"]),
     }
 
-  @staticmethod
-  def collect_model_data(model_v2) -> dict[str, Any]:
-    data: dict[str, Any] = {}
-    if model_v2.leadsV3:
-      lead = model_v2.leadsV3[0]
-      data["lead0"] = {
-        "x": float(lead.x[0]) if lead.x else 0.0,
-        "y": float(lead.y[0]) if lead.y else 0.0,
-        "v": float(lead.v[0]) if lead.v else 0.0,
-        "prob": float(lead.prob),
-      }
-    else:
-      data["lead0"] = {"x": 0.0, "y": 0.0, "v": 0.0, "prob": 0.0}
-    data["laneLineProbs"] = [float(prob) for prob in capnp_items(model_v2.laneLineProbs, 4)]
-    lane_line_stds = getattr(model_v2, "laneLineStds", [])
-    data["laneLineStds"] = [float(std) for std in capnp_items(lane_line_stds, 4)]
-    data["laneLines"] = [
-      {
-        "x": [float(x) for x in capnp_items(lane_line.x, 33)],
-        "y": [float(y) for y in capnp_items(lane_line.y, 33)],
-        "z": [float(z) for z in capnp_items(lane_line.z, 33)],
-      }
-      for lane_line in capnp_items(model_v2.laneLines, 4)
-    ]
-    road_edge_stds = getattr(model_v2, "roadEdgeStds", [])
-    data["roadEdgeStds"] = [float(std) for std in capnp_items(road_edge_stds, 2)]
-    data["roadEdges"] = [
-      {
-        "x": [float(x) for x in capnp_items(road_edge.x, 33)],
-        "y": [float(y) for y in capnp_items(road_edge.y, 33)],
-        "z": [float(z) for z in capnp_items(road_edge.z, 33)],
-      }
-      for road_edge in capnp_items(model_v2.roadEdges, 2)
-    ]
-    meta = model_v2.meta
-    data["meta"] = {
-      "distanceToRoadEdgeLeft": float(meta.distanceToRoadEdgeLeft),
-      "distanceToRoadEdgeRight": float(meta.distanceToRoadEdgeRight),
-    }
-    if model_v2.orientationRate.z:
-      data["curvature"] = {"maxOrientationRate": max((float(x) for x in model_v2.orientationRate.z), key=abs)}
-    else:
-      data["curvature"] = {"maxOrientationRate": 0.0}
-    return data
+  def collect_broadcast_data(self) -> dict[str, dict[str, float | int]] | None:
+    tesla_das_road = self.collect_tesla_das_road()
+    if tesla_das_road is None:
+      return None
+    return {"carState": tesla_das_road}
 
-  @staticmethod
-  def collect_system_state(selfdrive_state) -> dict[str, bool]:
-    return {"enabled": bool(selfdrive_state.enabled), "active": bool(selfdrive_state.active)}
-
-  @staticmethod
-  def collect_controls_state(controls_state, selfdrive_state=None) -> dict[str, Any]:
-    return {
-      "enabled": bool(getattr(selfdrive_state, "enabled", False)),
-      "active": bool(getattr(selfdrive_state, "active", False)),
-      "vCruise": float(getattr(selfdrive_state, "vCruise", 0.0)),
-      "curvature": float(getattr(controls_state, "curvature", 0.0)),
-      "state": str(getattr(selfdrive_state, "state", "")),
-      "experimentalMode": bool(getattr(selfdrive_state, "experimentalMode", False)),
-    }
-
-  def create_packet(self, data: dict[str, Any]) -> bytes:
+  def create_packet(self, data: dict[str, dict[str, float | int]]) -> bytes:
     return json.dumps({
       "version": 1,
       "sequence": self.sequence,
@@ -261,22 +221,10 @@ class XiaogeDataBroadcaster:
     rk = Ratekeeper(20, print_delay_threshold=None)
     try:
       while self.server_running:
-        self.sm.update(0)
-        data: dict[str, Any] = {}
-        if self.sm.alive["carState"]:
-          data["carState"] = self.collect_car_state(self.sm["carState"])
-          tesla_das_road = self.collect_tesla_das_road()
-          if tesla_das_road is not None:
-            data["carState"].update(tesla_das_road)
-        if self.sm.alive["modelV2"]:
-          data["modelV2"] = self.collect_model_data(self.sm["modelV2"])
-        if self.sm.alive["selfdriveState"]:
-          data["systemState"] = self.collect_system_state(self.sm["selfdriveState"])
-        if self.sm.alive["controlsState"]:
-          selfdrive_state = self.sm["selfdriveState"] if self.sm.alive["selfdriveState"] else None
-          data["controlsState"] = self.collect_controls_state(self.sm["controlsState"], selfdrive_state)
-        self.broadcast_to_clients(self.create_packet(data))
-        self.sequence += 1
+        data = self.collect_broadcast_data()
+        if data is not None:
+          self.broadcast_to_clients(self.create_packet(data))
+          self.sequence += 1
         rk.keep_time()
     except KeyboardInterrupt:
       pass

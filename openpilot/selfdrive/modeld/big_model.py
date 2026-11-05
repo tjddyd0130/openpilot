@@ -30,15 +30,16 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from openpilot.selfdrive.modeld.big_model_status import BigModelStatusReporter
+from openpilot.common import big_model_catalog
 
 
-DEFAULT_MANIFEST_URL = "https://upload.shind0.synology.me/models/comma4-big-mdm-8d736683/manifest.json"
-MDM_RETRAINED_MODEL = {
-  "model_id": "comma-pr39047-mdm-retrained-6f4c0faf-256f2178",
+DEFAULT_MANIFEST_URL = big_model_catalog.selected()['manifest_url']
+NAV_MODEL = {
+  "model_id": "comma-nav-n16-afbf2e54-52205044",
   "filename": "big_driving_tinygrad.pkl",
-  "size": 799_942_179,
-  "sha256": "256f2178366479a211933701c03518621ed3970289e6a8a43e5a2bcb15e55b5f",
-  "url": "https://upload.shind0.synology.me/models/comma4-big-mdm-8d736683/big_driving_tinygrad.pkl",
+  "size": 822_465_506,
+  "sha256": "52205044e136efb64a6a841c9b016cf35b1db81186dd0f941b62eee5ebdcde24",
+  "url": "https://upload.shind0.synology.me/models/comma4-big-nav-n16-96244b1f/big_driving_tinygrad.pkl",
 }
 MAX_MANIFEST_SIZE = 64 * 1024
 MAX_MODEL_SIZE = 4 * 1024 * 1024 * 1024
@@ -148,12 +149,10 @@ def _write_state(active: BigModelManifest, previous: BigModelManifest | None, ca
 
 
 def fetch_manifest(manifest_url: str = DEFAULT_MANIFEST_URL, timeout: float = 15.0) -> BigModelManifest:
-  # Pin retrained Mountain Dew from commaai/openpilot#39047 at 6f4c0faf.
-  # Upstream publishes only a generic precompiled PKL for this checkpoint.
-  # Keep the environment/CLI override path below so a different manifest can
-  # still be tested explicitly without changing this branch.
-  if manifest_url == DEFAULT_MANIFEST_URL:
-    return BigModelManifest.from_dict(MDM_RETRAINED_MODEL, manifest_url)
+  # Reviewed catalog pins are resolved without network and stay fixed this boot.
+  for entry in big_model_catalog.catalog().values():
+    if manifest_url == entry['manifest_url']:
+      return BigModelManifest.from_dict(entry['egpu'], manifest_url)
 
   req = Request(manifest_url, headers={"Accept": "application/json", "User-Agent": "carrot-modeld/1"})
   with urlopen(req, timeout=timeout) as response:

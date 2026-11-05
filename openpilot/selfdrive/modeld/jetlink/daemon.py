@@ -18,9 +18,12 @@ from openpilot.selfdrive.modeld.jetlink.phase import Publisher as PhasePublisher
 from openpilot.selfdrive.modeld.jetlink.mac import prepare, PreparationDeferred
 from openpilot.selfdrive.modeld.jetlink.compat import ProtocolChoice
 from openpilot.selfdrive.modeld.jetlink.mobile import transport_mode, setup_gadget, MobileCable, AutoTransport, MobileLinkError
+from openpilot.selfdrive.modeld.jetlink.power import UsbInputPower
+from openpilot.selfdrive.modeld.jetlink.scheduling import UsbCompletionPriority
 from openpilot.selfdrive.modeld.jetlink.contracts import model_name
 from openpilot.selfdrive.modeld.jetlink.selection import ModelChanged, check_loaded
-from openpilot.selfdrive.modeld.jetlink.startup import CAPABILITY as BOOT_UPDATE_CAPABILITY, wait_for_boot_update
+from openpilot.selfdrive.modeld.jetlink.startup import (CAPABILITY as BOOT_UPDATE_CAPABILITY, wait_for_boot_update,
+                                                       RuntimeHandoff, ConnectionStartup)
 from jetlink.client import JetlinkClient
 from jetlink.transport.base import LinkError, LinkTimeout
 from jetlink.transport.ffs import FfsTransport
@@ -34,9 +37,10 @@ ACTIVE_UDC = None
 SESSION_DETACHED = False
 log = logging.getLogger('carrot.jetlink')
 sys.path.insert(0, str(VENDOR.parents[1] / 'tools/jetlink'))
-from hud_protocol import Publisher, HUD_CAPABILITY, HUD_MESSAGE
+from hud_protocol import Publisher, HUD_MESSAGE
+from hud_wifi import publisher as display_publisher, USB_CAPABILITY as HUD_USB_CAPABILITY
 from hud_navi import CAPABILITY as NAVI_CAPABILITY, MESSAGE as NAVI_MESSAGE
-from hud_navi import send_ready_after_reply, PUMP_CAPABILITY
+from hud_navi import send_ready_after_reply, send_ready_during_inference, PUMP_CAPABILITY
 from wifi_protocol import CAPABILITY as WIFI_CAPABILITY, Publisher as WifiPublisher
 
 
@@ -61,19 +65,34 @@ def update_affinity():
 
 
 def publish_hud(client, publisher):
+  # Packet construction/Cap'n Proto encoding is in the publisher child. These
+  # scopes measure only snapshot access and synchronous writes on the USB owner.
+  metrics = dict(display_snapshot_read_ms=0., display_hud_send_ms=0., display_media_read_ms=0.,
+                 display_media_send_ms=0., display_hud_bytes=0, display_media_bytes=0)
   if publisher is not None:
+    started = time.monotonic()
     try:
       packet = publisher.packet()
     except Exception:
       log.exception('display snapshot unavailable')
-      return
+      return metrics
+    ready = time.monotonic()
+    metrics['display_snapshot_read_ms'] = (ready - started) * 1000
     if packet:
       client.t.send(HUD_MESSAGE, client._next_seq(), [packet])
+      metrics['display_hud_bytes'] = len(packet)
+    sent = time.monotonic()
+    metrics['display_hud_send_ms'] = (sent - ready) * 1000
     # At most one small fragment per inference window. No video
     # decoding or unbounded stream draining occurs on the USB owner's thread.
     media = publisher.media_packet()
+    ready = time.monotonic()
+    metrics['display_media_read_ms'] = (ready - sent) * 1000
     if media:
       client.t.send(NAVI_MESSAGE, client._next_seq(), [media])
+      metrics['display_media_bytes'] = len(media)
+    metrics['display_media_send_ms'] = (time.monotonic() - ready) * 1000
+  return metrics
 
 
 def host_attached():
@@ -122,6 +141,38 @@ def publish(status, spec=None, **extra):
 
 
 class CarrotTransport(FfsTransport):
+  def enable_read_pipeline(self):
+    from openpilot.cereal import messaging
+    sm = messaging.SubMaster(['carState', 'carControl', 'selfdriveState'])
+    end = time.monotonic() + 1.
+    while time.monotonic() < end:
+      sm.update(100)
+    if not (all(sm.valid.values()) and all(sm.alive.values()) and sm['carState'].standstill
+            and str(sm['carState'].gearShifter) == 'park' and sm['carState'].vEgo == 0
+            and not sm['carControl'].enabled and not sm['selfdriveState'].active):
+      raise ValueError('AIO diagnostic requires fresh Park/inactive state')
+    from openpilot.selfdrive.modeld.jetlink.aio import load_library
+    library = load_library()
+    if library is not None:
+      self._aio_library = library
+      log.info('Jetson diagnostic: four 16KB AIO reads enabled')
+
+  def _read_packet(self, buf):
+    library = getattr(self, '_aio_library', None)
+    if library is None:
+      return super()._read_packet(buf)
+    reader = getattr(self, '_aio_reader', None)
+    if reader is None:
+      from openpilot.selfdrive.modeld.jetlink.aio import Reader
+      self._aio_reader = reader = Reader(self.ep_out, library)
+    return reader.read_into(buf)
+
+  def _finish_reads(self):
+    reader = getattr(self, '_aio_reader', None)
+    if reader is not None:
+      reader.close()
+      self._aio_reader = None
+
   def _configured(self):
     deadline = getattr(self, '_probe_deadline', None)
     if deadline is not None and time.monotonic() >= deadline:
@@ -158,6 +209,8 @@ class CarrotTransport(FfsTransport):
     watchdog = getattr(getattr(self, '_write_guard', None), 'thread', None)
     gadget = getattr(self, 'gadget', None)
     super().close()
+    if getattr(getattr(self, '_aio_reader', None), 'context', None) is not None:
+      raise UnsafeCleanupError('FunctionFS AIO cleanup incomplete; refusing to rebind')
     if any(thread is not None and thread.is_alive() for thread in (reader, watchdog)):
       raise UnsafeCleanupError('FunctionFS cleanup left an active reader/watchdog; refusing to rebind')
     if gadget is not None:
@@ -179,26 +232,35 @@ class CarrotTransport(FfsTransport):
 
 
 def serve_local(listener, client, peer, wifi=None):
-  publisher = Publisher(navi=bool(peer.get(NAVI_CAPABILITY))) if peer.get(HUD_CAPABILITY) else None
+  from blink_protocol import Sender as BlinkerSender
+  publisher = display_publisher(client, peer, Publisher)
   phase = PhasePublisher()
+  blinker = None
   try:
-    _serve_local(listener, client, peer, publisher, phase, wifi)
+    blinker = BlinkerSender(client, peer)
+    _serve_local(listener, client, peer, publisher, phase, wifi, blinker if blinker.enabled else None)
   finally:
+    if blinker is not None:
+      blinker.close()
     phase.close()
     if publisher is not None:
       publisher.close()
 
 
-def _serve_local(listener, client, peer, publisher, phase, wifi=None):
+def _serve_local(listener, client, peer, publisher, phase, wifi=None, blinker=None):
   from openpilot.common.params import Params
   from openpilot.common.runtime_diagnostics import RuntimeDiagnostics
   from openpilot.common.swaglog import cloudlog
   params = Params()
-  diagnostics = RuntimeDiagnostics('jetlinkd', cloudlog.event)
+  diagnostics = RuntimeDiagnostics('jetlinkd', cloudlog.event, peak_metric='usb_exchange_ms')
+  from tools.jetlink.model_library import Client as ModelLibrary  # noqa: TID251 -- shared standalone host protocol
+  library = ModelLibrary(peer)
   last_status = 0.
   last_ping = time.monotonic()
   telemetry_updated = 0.
+  hud_connected = None
   spec = client.spec
+  usb_display = publisher is not None and (peer.get('carrot_host') != 'jetson' or peer.get(HUD_USB_CAPABILITY) is True)
   requested = True
   follows_app = peer.get('protocol') == 3 and may_provision(peer, session_mode())
   while host_attached():
@@ -215,18 +277,26 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
     try:
       connection, _ = listener.accept()
     except TimeoutError:
-      if wifi is not None:
-        wifi.send(client)
-      publish_hud(client, publisher)
-      if time.monotonic() - last_ping > 2:
+      library.idle(client, params)
+      if time.monotonic() - last_ping > (.2 if blinker is not None else 2):
         client.last_state = client.state()
         check_loaded(client, client.last_state)
         telemetry_updated = time.monotonic()
         last_ping = time.monotonic()
+      if blinker is not None:
+        blinker.send(client)
+      if wifi is not None:
+        wifi.send(client)
+      if usb_display:
+        publish_hud(client, publisher)
       continue
     with connection:
-      connection.settimeout(.5)
-      reader = PacketReader(REQUEST.size + spec.warped_nbytes + spec.packed_nbytes)
+      connection.settimeout(.1 if blinker is not None else .5)
+      from jetlink import deferred_map
+      reader = PacketReader(REQUEST.size + spec.warped_nbytes + spec.packed_nbytes + deferred_map.META.size)
+      from openpilot.selfdrive.modeld.jetlink import shared_input
+      shared = None
+      first_request = True
       try:
         if not requested:
           check_loaded(client, client.state())
@@ -234,13 +304,24 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
           if result.to_dict() != spec.to_dict():
             raise ModelChanged('Jetlink model contract changed before local inference')
           requested = True
-        send(connection, json.dumps({'spec': spec.to_dict(), 'peer': peer}).encode())
+        from jetlink import output_projection as projection
+        compact_reply = client.output_projection_available
+        deferred_available = bool(getattr(client, 'deferred_map_available', False))
+        hello = {'spec': spec.to_dict(), 'peer': peer, shared_input.CAPABILITY: shared_input.supported()}
+        if compact_reply:
+          hello[projection.IPC_CAPABILITY] = projection.descriptor()
+        if deferred_available:
+          hello[deferred_map.IPC_CAPABILITY] = deferred_map.descriptor()
+        send(connection, json.dumps(hello).encode())
         while host_attached():
           loop_started, cpu_started = time.monotonic(), time.thread_time()
           if time.monotonic() - last_status >= 1:
             update_affinity()
             if publisher is not None:
-              params.put_bool_nonblocking('ClusterHudConnected', bool((client.last_state or {}).get('carrot_hud_connected')))
+              connected = bool((client.last_state or {}).get('carrot_hud_connected'))
+              if connected != hud_connected:
+                params.put_bool_nonblocking('ClusterHudConnected', connected)
+                hud_connected = connected
             publish('ready', spec=spec, peer=peer, timings=list(client.last_timings),
                     telemetry=client.last_state, telemetry_updated=telemetry_updated,
                     navigation_tail=getattr(publisher, 'tail_stats', {}))
@@ -249,34 +330,76 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
           try:
             request = reader.receive(connection)
           except TimeoutError:
+            if blinker is not None:
+              blinker.send(client)
             if wifi is not None:
               wifi.send(client)
-            publish_hud(client, publisher)
+            if usb_display:
+              publish_hud(client, publisher)
             client.last_state = client.state()
             check_loaded(client, client.last_state)
             telemetry_updated = time.monotonic()
             continue
           received = time.monotonic()
-          if len(request) != REQUEST.size + spec.warped_nbytes + spec.packed_nbytes:
-            raise ValueError('invalid local inference request')
-          frame, reset, source_sof = REQUEST.unpack_from(request)
-          if reset not in (0, 1):
+          if first_request and bytes(request) == shared_input.SETUP:
+            first_request = False
+            shared = shared_input.Reader.offer(connection, spec)
+            send(connection, shared.nonce)
+            continue
+          first_request = False
+          wire_request_bytes = 4 + len(request)
+          nav_meta = None
+          base_sizes = [REQUEST.size + spec.warped_nbytes + spec.packed_nbytes]
+          if shared is not None:
+            base_sizes.append(shared_input.TOKEN.size)
+          for base_size in base_sizes:
+            if len(request) == base_size + deferred_map.META.size:
+              nav_meta = deferred_map.META.unpack_from(request, base_size)
+              request = request[:base_size]
+              break
+          shared_request = shared is not None and len(request) == shared_input.TOKEN.size
+          if shared_request:
+            frame, reset, source_sof, images, packed = shared.read(request)
+          else:
+            if len(request) != REQUEST.size + spec.warped_nbytes + spec.packed_nbytes:
+              raise ValueError('invalid local inference request')
+            frame, reset, source_sof = REQUEST.unpack_from(request)
+            images = np.frombuffer(request, np.uint8, spec.warped_nbytes, REQUEST.size).reshape(spec.warped_shape)
+            packed = np.frombuffer(request, np.float32, spec.packed_nelem, REQUEST.size + spec.warped_nbytes)
+          if (reset not in range(8) or (reset & projection.IPC_FLAG and not compact_reply) or
+              bool(reset & deferred_map.IPC_FLAG) != (nav_meta is not None) or
+              (nav_meta is not None and not deferred_available)):
             raise ValueError('invalid reset flag')
-          images = np.frombuffer(request, np.uint8, spec.warped_nbytes, REQUEST.size).reshape(spec.warped_shape)
-          packed = np.frombuffer(request, np.float32, spec.packed_nelem, REQUEST.size + spec.warped_nbytes)
+          client.project_output = bool(reset & projection.IPC_FLAG)
           if not np.all(np.isfinite(packed)):
             raise ValueError('invalid local model context')
           started = time.monotonic()
-          seq = client.infer_begin(images, packed, frame, reset=bool(reset), want_state=(frame % 20 == 0))
+          map_options = {'nav_metadata': nav_meta} if nav_meta is not None else {}
+          # Output ownership needs fresh receiver health within 500 ms. The
+          # usual 1 Hz display telemetry would repeatedly expire that lease.
+          seq = client.infer_begin(images, packed, frame, reset=bool(reset & 1),
+                                   want_state=(blinker is not None or frame % 20 == 0), **map_options)
           sent = time.monotonic()
           if peer.get('carrot_host') == 'jetson':
             phase.sent(source_sof)
           phase_done = time.monotonic()
-          if peer.get(NAVI_CAPABILITY):
-            publish_hud(client, publisher)
+          map_bytes = client.flush_map() if nav_meta is not None else 0
+          map_done = time.monotonic()
+          display_metrics = {}
+          early_media_ms = 0.
+          early_media_bytes = 0
+          if usb_display and peer.get(NAVI_CAPABILITY):
+            display_metrics = publish_hud(client, publisher) or {}
+            if peer.get('carrot_host') == 'jetson' and peer.get(PUMP_CAPABILITY) is True and not map_bytes:
+              early_started = time.monotonic()
+              early_media_bytes = send_ready_during_inference(client, publisher, sent)
+              early_media_ms = (time.monotonic() - early_started) * 1000
           hud_done = time.monotonic()
           previous_state = client.last_state
           output = client.infer_end(seq)
+          receive = getattr(getattr(client, 't', None), 'last_receive', None) or {}
+          receive_metrics = {f'response_reader_{key}_max_ms': receive[key] * 1000
+                             for key in ('prepare', 'read_wait', 'handoff') if key in receive}
           check_loaded(client, client.last_state)
           if client.last_state is not previous_state:
             telemetry_updated = time.monotonic()
@@ -290,9 +413,11 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
               log.warning('USB frame %d: send %.1f response %.1f IPC %.1f ms', frame,
                           (sent-started)*1000, (completed-sent)*1000, (time.monotonic()-completed)*1000)
           replied = time.monotonic()
-          if not peer.get(NAVI_CAPABILITY):
-            publish_hud(client, publisher)
-          else:
+          if blinker is not None:
+            blinker.send(client)
+          if usb_display and not peer.get(NAVI_CAPABILITY):
+            display_metrics = publish_hud(client, publisher) or {}
+          elif usb_display and not (peer.get('carrot_host') == 'jetson' and peer.get(PUMP_CAPABILITY) is True):
             # modeld already has its reply. Drain only a bounded ready tail;
             # never add these fragments before infer_end or delay its reply.
             send_ready_after_reply(client, publisher, fast_receiver=peer.get(PUMP_CAPABILITY) is True)
@@ -306,11 +431,23 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
             context={'frame_id': frame, 'usb_seq': seq},
             housekeeping_ms=(receive_started-loop_started)*1000,
             ipc_receive_ms=(received-receive_started)*1000,
+            ipc_request_bytes=wire_request_bytes,
+            ipc_shared_input=int(shared_request),
             request_parse_ms=(started-received)*1000,
             usb_send_ms=(sent-started)*1000,
+            request_bytes=getattr(client, 'last_request_bytes', spec.infer_req_nbytes),
             phase_ms=(phase_done-sent)*1000,
+            map_stage_ms=(map_done-phase_done)*1000,
+            map_stage_bytes=map_bytes,
+            map_deferred_used=int(nav_meta is not None and getattr(client, 'last_map_used', False)),
             hud_ms=(hud_done-phase_done)*1000,
             usb_response_ms=(completed-hud_done)*1000,
+            # Same-frame totals: HUD overlaps server execution, so separate
+            # aggregate maxima must never be added to estimate response latency.
+            usb_exchange_ms=(completed-started)*1000,
+            submit_to_response_ms=(completed-sent)*1000,
+            display_early_media_ms=early_media_ms,
+            display_early_media_bytes=early_media_bytes,
             ipc_reply_ms=(replied-completed)*1000,
             display_tail_ms=(tail_done-replied)*1000,
             wifi_tail_ms=(finished-tail_done)*1000,
@@ -319,9 +456,14 @@ def _serve_local(listener, client, peer, publisher, phase, wifi=None):
             server_total_ms=client.last_timings[2]/1000,
             loop_ms=(finished-loop_started)*1000,
             thread_cpu_ms=(time.thread_time()-cpu_started)*1000,
+            **display_metrics,
+            **receive_metrics,
           )
       except (ConnectionError, BrokenPipeError, ValueError) as exc:
         log.info('local client ended: %s', exc)
+      finally:
+        if shared is not None:
+          shared.close()
     last_ping = time.monotonic()
 
 
@@ -361,14 +503,20 @@ def main():
   usb_mode = None
   tcp_seen = False
   mobile_unavailable = False
+  startup = ConnectionStartup()
+  usb_power = UsbInputPower()
   try:
     while True:
+      usb_power.step()
       update_affinity()
       if cleanup_error:
         publish('blocked', peer=None, error=cleanup_error)
         time.sleep(1)
         continue
       if SESSION_DETACHED or not host_attached():
+        from openpilot.common.params import Params
+        road_params = Params()
+        startup.absent(offroad=road_params.get_bool('IsOffroad'), onroad=road_params.get_bool('IsOnroad'))
         if owner is not None or cable is not None:
           cleanup_error = close_resources(cable, owner)
           owner = cable = None
@@ -392,6 +540,9 @@ def main():
       client = None
       wifi = None
       transport = None
+      usb_priority = UsbCompletionPriority()
+      preparing = False
+      startup.begin(time.monotonic())
       try:
         publish('connecting', peer=peer, protocol=protocol.version)
         gc.collect()
@@ -444,7 +595,8 @@ def main():
             raise ValueError('Selected iOS cable requires protocol 3')
           wire_protocol = ProtocolChoice('3')
         transport.protocol_version = wire_protocol.version
-        client = JetlinkClient(transport, name='carrot-jetlink')
+        client = JetlinkClient(transport, name='carrot-jetlink', allow_output_projection=True,
+                               allow_request_chunks=os.getenv('JETLINK_REQUEST_CHUNKS', '1') != '0')
         if TRANSPORT_MODE == 'auto' and transport is owner and usb_mode is None and not mobile_unavailable:
           usb_probes += 1
           publish('connecting', peer=None, preparation={'stage': 'usb-probe',
@@ -452,6 +604,7 @@ def main():
           peer = probe_usb(client, wire_protocol)
         else:
           peer = greet(client, wire_protocol)
+        preparing = True
         if TRANSPORT_MODE == 'auto':
           selected = classify_auto_peer(peer, 'tcp' if transport is not owner else 'usb')
           if selected is None and transport is owner and legacy_usb_peer(peer):
@@ -487,11 +640,21 @@ def main():
         spec = client.spec
         if spec is None:
           raise ValueError('Jetlink preparation completed without a model spec')
+        # Volatile parked diagnostic only until native cancellation/latency is
+        # verified. Other peers and all ordinary boots retain serial reads.
+        if (peer.get('carrot_host') == 'jetson' and transport is owner
+            and Path('/dev/shm/carrot-jetlink-aio-test').is_file()):
+          owner.enable_read_pipeline()
         # Warm independently of camera/modeld; every real session resets state.
+        usb_priority.start(peer, bulk_usb=transport is owner)
         for frame in range(10):
           client.infer(np.zeros(spec.warped_shape, np.uint8), np.zeros(spec.packed_nelem, np.float32), frame, reset=True)
         log.info('Jetlink ready: %s', peer)
+        startup.ready_once = True
         serve_local(listener, client, peer, wifi)
+      except RuntimeHandoff as exc:
+        log.info('%s', exc)
+        publish('connecting', peer=peer, preparation={'stage': 'runtime-handoff'})
       except PreparationDeferred as exc:
         log.info('%s', exc)
         publish('loading', peer=peer, preparation={'stage': 'waiting', 'message': str(exc)})
@@ -503,12 +666,17 @@ def main():
         log.exception('Jetlink cable setup failed')
         if TRANSPORT_MODE == 'auto' and not mobile_unavailable:
           mobile_unavailable = True
-          publish('retrying', peer=None, error=f'iOS/NCM unavailable; retrying bulk USB after verified cleanup: {exc}'[:300])
+          error = str(exc) if '[adb-handoff:' in str(exc) else f'iOS/NCM unavailable; retrying bulk USB after verified cleanup: {exc}'
+          publish('retrying', peer=None, error=error[:300])
         else:
           publish('retrying', peer=None, error=str(exc)[:300])
       except Exception as exc:
-        log.exception('Jetlink connection failed')
-        publish('retrying', peer=peer, error=str(exc)[:300])
+        if startup.waiting(exc, now=time.monotonic(), preparing=preparing):
+          log.info('Waiting for initial Jetlink handshake: %s', exc)
+          publish('connecting', peer=peer, error=str(exc)[:300], preparation={'stage': 'waiting-host'})
+        else:
+          log.exception('Jetlink connection failed')
+          publish('retrying', peer=peer, error=str(exc)[:300])
       finally:
         ACTIVE_UDC = None
         if client is not None and client.last_state is not None and 'carrot_hud_connected' in client.last_state:
@@ -517,7 +685,7 @@ def main():
             Params().put_bool_nonblocking('ClusterHudConnected', False)
           except Exception:
             log.exception('Jetlink HUD cleanup failed')
-        cleanup_error = close_resources(wifi, client) or cleanup_error
+        cleanup_error = close_resources(usb_priority, wifi, client) or cleanup_error
         if client is None and transport is not owner:
           cleanup_error = close_resources(transport) or cleanup_error
         if TRANSPORT_MODE not in ('auto', 'ios'):

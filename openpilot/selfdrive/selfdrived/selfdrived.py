@@ -23,6 +23,8 @@ from openpilot.selfdrive.selfdrived.events import Events, ET, EmptyAlert
 from openpilot.selfdrive.selfdrived.helpers import ExcessiveActuationCheck
 from openpilot.selfdrive.selfdrived.state import StateMachine
 from openpilot.selfdrive.selfdrived.impact_detector import ImpactDetector
+from openpilot.selfdrive.controls.lib.radar_only_warning import RadarOnlyWarning
+from openpilot.selfdrive.carrot.radar_motion.timing import front_radar_distance_delay_s
 from openpilot.selfdrive.selfdrived.alertmanager import AlertManager, set_offroad_alert
 from openpilot.selfdrive.controls.lib.cutin_alert import (
   CutinAlertCandidate,
@@ -87,7 +89,8 @@ class SelfdriveD:
     # TODO: de-couple selfdrived with card/conflate on carState without introducing controls mismatches
     self.car_state_sock = messaging.sub_sock('carState', timeout=20)
 
-    ignore = self.sensor_packets + self.gps_packets + ['alertDebug']
+    # Optional advisory input must not become a controls-readiness dependency.
+    ignore = self.sensor_packets + self.gps_packets + ['alertDebug', 'liveTracks']
     if SIMULATION:
       ignore += ['driverCameraState', 'managerState']
     if self.CP.notCar or SIMULATION:
@@ -100,7 +103,7 @@ class SelfdriveD:
         ignore += ['wideRoadCameraState']
     self.sm = messaging.SubMaster(['deviceState', 'pandaStates', 'peripheralState', 'modelV2', 'liveCalibration',
                                    'carOutput', 'driverMonitoringState', 'longitudinalPlan', 'livePose', # 'liveDelay',
-                                   'managerState', 'liveParameters', 'radarState', 'liveTorqueParameters',
+                                   'managerState', 'liveParameters', 'radarState', 'liveTracks', 'liveTorqueParameters',
                                    'carrotMan',
                                    'controlsState', 'carControl', 'driverAssistance', 'alertDebug', 'userBookmark', 'audioFeedback'] + \
                                    self.camera_packets + self.sensor_packets + self.gps_packets,
@@ -141,11 +144,14 @@ class SelfdriveD:
     self.recalibrating_seen = False
     self.dm_lockout_set = self.params.get_bool("DriverTooDistracted")
     self.cutin_audio_tracker = CutinAlertTracker()
+    self.radar_only_warning = RadarOnlyWarning(front_radar_distance_delay_s(self.CP))
+    self.car_state_time_s = 0.0
     self.dm_uncertain_alerted = False
     self.dm_disabled_prev = False
     self.update_reboot_alerted = False
     self.system_ready_alerted = False
     self.system_ready_since = None
+    self.nnff_alerted = False
     self.big_model_loading = False
     self.big_model_active = False
     self.big_model_ready_t = 0.0
@@ -154,6 +160,8 @@ class SelfdriveD:
     self.rk = Ratekeeper(100, print_delay_threshold=None)
 
     self.atc_type_last = ""
+    self.atc_turn_start = 0
+    self.atc_turn_direction = LaneChangeDirection.none
 
 
     # some comma three with NVMe experience NVMe dropouts mid-drive that
@@ -251,6 +259,12 @@ class SelfdriveD:
     cutin_alert = self.cutin_audio_tracker.update(promoted_cutins, cutin_enabled)
     if cutin_alert:
       self.events.add(EventName.radarCutin)
+
+    if self.radar_only_warning.update_live(
+      self.car_state_time_s if REPLAY else time.monotonic(), CS, self.sm,
+      self.enabled and self.CP.openpilotLongitudinalControl,
+    ):
+      self.events.add(EventName.radarStationaryLead)
 
     # Block resume if cruise never previously enabled
     resume_pressed = any(be.type in (ButtonType.accelCruise, ButtonType.resumeCruise) for be in CS.buttonEvents)
@@ -356,17 +370,7 @@ class SelfdriveD:
       self.events.add(EventName.excessiveActuation)
     # ******************************************************************************************
 
-    if self.sm.alive['carrotMan']:
-      atc_type = self.sm['carrotMan'].atcType
-      if atc_type != self.atc_type_last:
-        if "prepare" not in atc_type and "prepare" in self.atc_type_last: # fork left/right prepare -> fork left/right
-          if "fork" in atc_type:
-            self.events.add(EventName.audioLaneChange)
-        elif "prepare" in atc_type:
-          pass
-        elif "turn" in atc_type and "turn" not in self.atc_type_last:   # fork left/right -> turn left/right
-          self.events.add(EventName.audioTurn)
-        self.atc_type_last = atc_type
+    self.update_atc_events()
 
     # Handle lane change
     if self.sm['modelV2'].meta.laneChangeState == LaneChangeState.preLaneChange:
@@ -548,8 +552,6 @@ class SelfdriveD:
 
       if self.sm['modelV2'].frameDropPerc > 20:
         self.events.add(EventName.modeldLagging)
-    if self.sm.frame == 550 and Params().get("NNFFModelName") is not None:
-      self.events.add(EventName.torqueNNLoad)
     # decrement personality on distance button press
     #if self.CP.openpilotLongitudinalControl:
     #  if any(not be.pressed and be.type == ButtonType.gapAdjustCruise for be in CS.buttonEvents):
@@ -582,6 +584,8 @@ class SelfdriveD:
   def data_sample(self):
     car_state = messaging.recv_one(self.car_state_sock)
     CS = car_state.carState if car_state else self.CS_prev
+    if car_state is not None:
+      self.car_state_time_s = car_state.logMonoTime * 1e-9
 
     self.sm.update(0)
 
@@ -646,6 +650,23 @@ class SelfdriveD:
     self.update_alerts(CS)
     self.system_ready_alerted = True
 
+  def update_nnff_alert(self, CS):
+    # Retry after startup instead of losing the notice when initialization takes
+    # longer than 5.5 seconds. Poll at 2 Hz, including a late model-name write.
+    if self.nnff_alerted or self.sm.frame < 550 or self.sm.frame % 50:
+      return
+    if (not self.initialized or self.CP.passive or not self.sm['deviceState'].started
+        or not CS.canValid or CS.canTimeout or not self.sm.all_checks()
+        or self.events.contains(ET.NO_ENTRY) or self.AM.current_alert is not EmptyAlert):
+      return
+    if self.params.get("NNFFModelName") is None:
+      return
+    # Called after this frame's alert selection and readiness chime, so neither
+    # an existing warning nor a new warning can consume the one-shot notice.
+    self.events.add(EventName.torqueNNLoad)
+    self.update_alerts(CS)
+    self.nnff_alerted = True
+
   def update_impact_dashcam(self, CS):
     if REPLAY or SIMULATION or self.CP.notCar:
       return
@@ -702,6 +723,23 @@ class SelfdriveD:
     self.AM.add_many(self.sm.frame, alerts)
     self.AM.process_alerts(self.sm.frame, clear_event_types)
 
+  def update_atc_events(self):
+    if self.sm.alive['carrotMan']:
+      atc_type = self.sm['carrotMan'].atcType
+      if atc_type != self.atc_type_last:
+        if "prepare" not in atc_type and "prepare" in self.atc_type_last: # fork left/right prepare -> fork left/right
+          if "fork" in atc_type:
+            self.events.add(EventName.audioLaneChange)
+        elif "prepare" in atc_type:
+          pass
+        elif "turn" in atc_type and "turn" not in self.atc_type_last:   # fork left/right -> turn left/right
+          self.events.add(EventName.audioTurn)
+          direction = {"turn left": LaneChangeDirection.left, "turn right": LaneChangeDirection.right}.get(atc_type)
+          if direction is not None:
+            self.atc_turn_start = time.monotonic_ns()
+            self.atc_turn_direction = direction
+        self.atc_type_last = atc_type
+
   def publish_selfdriveState(self, CS):
     # selfdriveState
     ss_msg = messaging.new_message('selfdriveState')
@@ -723,6 +761,8 @@ class SelfdriveD:
     ss.alertHudVisual = self.AM.current_alert.visual_alert
 
     ss.distanceTraveled = float(self.distance_traveled)
+    ss.atcTurnStartMonoTime = self.atc_turn_start
+    ss.atcTurnDirection = self.atc_turn_direction
 
     self.pm.send('selfdriveState', ss_msg)
 
@@ -747,6 +787,7 @@ class SelfdriveD:
     self.update_alerts(CS)
 
     self.update_system_ready_alert(CS)
+    self.update_nnff_alert(CS)
 
     self.publish_selfdriveState(CS)
 

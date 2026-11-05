@@ -11,6 +11,79 @@ import pytest
 from openpilot.selfdrive.modeld import precompiled_runner as runner
 
 
+@pytest.mark.parametrize('cancel_mid_line', [False, True])
+def test_recovery_receive_handles_fragmented_lines_without_an_uncancellable_readline(monkeypatch, cancel_mid_line):
+  import threading
+  model = object.__new__(runner.PrecompiledModelState)
+  model.recovery_cancel = threading.Event()
+  model.process = SimpleNamespace(stdout=SimpleNamespace(fileno=lambda: 9), poll=lambda: None)
+  class Selector:
+    def __enter__(self):
+      return self
+    def __exit__(self, *args):
+      pass
+    def register(self, *args):
+      pass
+    def select(self, timeout):
+      assert timeout <= .05
+      return [True]
+  monkeypatch.setattr(runner.selectors, 'DefaultSelector', Selector)
+  chunks = iter([b'he', b'llo\n'])
+  def read(fd, size):
+    if cancel_mid_line:
+      model.recovery_cancel.set()
+    return next(chunks)
+  monkeypatch.setattr(runner.os, 'read', read)
+  try:
+    if cancel_mid_line:
+      with pytest.raises(InterruptedError):
+        model._receive(1)
+    else:
+      assert model._receive(1) == b'hello\n'
+  finally:
+    model.process = None
+
+
+def test_cancelled_recovery_does_not_blacklist_the_artifact(tmp_path, monkeypatch):
+  import threading
+  cancel = threading.Event()
+  cancel.set()
+  process = SimpleNamespace(stdin=io.BytesIO(), stdout=io.BytesIO(), poll=lambda: 0)
+  monkeypatch.setattr(runner.subprocess, 'Popen', lambda *a, **kw: process)
+  def receive(self, timeout):
+    raise InterruptedError('eGPU recovery cancelled')
+  monkeypatch.setattr(runner.PrecompiledModelState, '_receive', receive)
+  with pytest.raises(InterruptedError):
+    runner.PrecompiledModelState(1344, 760, tmp_path / 'model.pkl', recovery_cancel=cancel)
+  assert not (tmp_path / 'last_failure.json').exists()
+  assert not (tmp_path / 'rejected').exists()
+
+
+@pytest.mark.parametrize('map_dtype,command_shape', [(np.uint8, (47,)), (np.float32, (1, 47))])
+def test_nav_inputs_keep_pixel_range_and_clear_when_missing(map_dtype, command_shape):
+  model = object.__new__(runner.PrecompiledModelState)
+  model.close = lambda: None
+  model.process = SimpleNamespace(stdin=io.BytesIO())
+  model.first_run = False
+  model.frame_size = 16
+  model.prev_desire = np.zeros(8, np.float32)
+  model.views = {key: np.zeros(shape, np.float32) for key, shape in
+                 {'img': 16, 'big_img': 16, 'desire': 8, 'traffic_convention': 2, 'action_t': 2,
+                  'tfm': (3, 3), 'big_tfm': (3, 3), 'navigation': 47}.items()}
+  model.views['nav_map'] = np.zeros((1, 1, 256, 256), map_dtype)
+  model.views['navigation'] = np.zeros(command_shape, np.float32)
+  model._receive = lambda _: b'1\n'
+  model.output, model.output_slices = np.zeros(4), {}
+  model.parser = SimpleNamespace(parse_outputs=lambda value: value)
+  frames = {key: SimpleNamespace(data=np.zeros(16, np.uint8)) for key in ('img', 'big_img')}
+  transforms = {key: np.eye(3, dtype=np.float32) for key in frames}
+  inputs = {'desire_pulse': np.zeros(8, np.float32), 'traffic_convention': np.zeros(2), 'action_t': np.zeros(2)}
+  model.run(frames, transforms, dict(inputs, nav_map=np.full((256, 256), 255, np.uint8), navigation=np.ones(47)), False)
+  assert model.views['nav_map'].min() == 255 and model.views['navigation'].min() == 1
+  model.run(frames, transforms, inputs, False)
+  assert not model.views['nav_map'].any() and not model.views['navigation'].any()
+
+
 def test_precompiled_state_exposes_camera_inputs_required_by_modeld(tmp_path, monkeypatch):
   info = {'size': 48, 'input_bytes': 32, 'output_count': 4,
           'layout': {'img': {'offset': 0, 'shape': [16], 'dtype': 'uint8'},
@@ -74,6 +147,7 @@ def test_inference_shutdown_releases_worker_without_rejecting_artifact(monkeypat
 
 
 @pytest.mark.parametrize('message,rejected', [('RuntimeError: PCIe link not up (LTSSM=0x00)', False),
+                                             ('RuntimeError: previous eGPU worker is still exiting', False),
                                              ('RuntimeError: bulk OUT 0x02 failed: Input/Output Error', False),
                                              ('RuntimeError: libusb_control_transfer: No such device (it may have been disconnected)', False),
                                              ('Traceback (most recent call last):\n  worker startup\n' +
@@ -99,6 +173,9 @@ def test_worker_error_protocol_preserves_cause_and_artifact_decision(tmp_path, m
     def select(self, timeout):
       return [True]
   monkeypatch.setattr(runner.selectors, 'DefaultSelector', ReadySelector)
+  process.stdout = SimpleNamespace(fileno=lambda: 9, closed=False)
+  process.stdout.close = lambda: setattr(process.stdout, 'closed', True)
+  monkeypatch.setattr(runner.os, 'read', lambda *args: payload)
   with pytest.raises(RuntimeError) as raised:
     runner.PrecompiledModelState(1928, 1208, tmp_path / 'model.pkl')
   assert str(raised.value) == message
@@ -125,6 +202,7 @@ def test_timeout_saves_worker_stage_before_cleanup(tmp_path, monkeypatch):
   from openpilot.selfdrive.modeld.egpu_worker_progress import WorkerProgress
   (tmp_path / 'installed.json').write_text(json.dumps({'pickle': {'sha256': 'a' * 64}}))
   paths = []
+  clock = [0.]
   def start(command, **kwargs):
     path = Path(command[3] + '.progress')
     progress = WorkerProgress(path)
@@ -141,9 +219,11 @@ def test_timeout_saves_worker_stage_before_cleanup(tmp_path, monkeypatch):
     def register(self, *args):
       pass
     def select(self, timeout):
+      clock[0] += timeout
       return []
   monkeypatch.setattr(runner.subprocess, 'Popen', start)
   monkeypatch.setattr(runner.selectors, 'DefaultSelector', TimeoutSelector)
+  monkeypatch.setattr(runner.time, 'monotonic', lambda: clock[0])
   with pytest.raises(TimeoutError, match='timed out'):
     runner.PrecompiledModelState(1928, 1208, tmp_path / 'model.pkl')
   failure = json.loads((tmp_path / 'last_failure.json').read_text())
@@ -163,7 +243,8 @@ def test_generic_runner_advances_dropped_frames_without_external_feature_queue(m
   model.output = np.array([1., 2.], np.float32)
   model.output_slices = {'action': slice(0, 2)}
   model.parser = SimpleNamespace(parse_outputs=lambda outputs: outputs)
-  monkeypatch.setattr(model, '_receive', lambda timeout: b'1\n')
+  deadlines = []
+  monkeypatch.setattr(model, '_receive', lambda timeout: deadlines.append(timeout) or b'1\n')
   frames = {name: SimpleNamespace(data=np.zeros(16, np.uint8)) for name in ('img', 'big_img')}
   transforms = {name: np.eye(3, dtype=np.float32) for name in frames}
   inputs = {'desire_pulse': np.eye(8, dtype=np.float32)[1], 'traffic_convention': np.array([1, 0]), 'action_t': np.array([.2, .3])}
@@ -174,6 +255,7 @@ def test_generic_runner_advances_dropped_frames_without_external_feature_queue(m
     assert model.process.stdin.getvalue() == b'rr'
     assert model.views['desire'][1] == 0
     np.testing.assert_array_equal(output['action'], [[1, 2]])
+    assert deadlines == [20, .15]
   finally:
     model.process = None
 
@@ -199,5 +281,53 @@ def test_fused_graph_publishes_completed_policy_after_camera_drop(monkeypatch):
     np.testing.assert_array_equal(outputs['action'], [[4., 5.]])
     np.testing.assert_array_equal(model.views['prev_feat'], [0., 1., 2., 3.])
     assert model.process.stdin.getvalue() == b'r'
+  finally:
+    model.process = None
+
+
+@pytest.mark.parametrize('responses,age,success', [([b'1\n', b'0\n', b'1\n'], .05, True),
+                                                ([b'1\n', b'0\n', b'0\n'], .05, False),
+                                                ([b'0\n'], .05, False),
+                                                ([b'1\n', b'0\n'], .101, False)])
+def test_hold_protocol_keeps_old_timestamp_and_desire_without_parsing(monkeypatch, responses, age, success):
+  model = object.__new__(runner.PrecompiledModelState)
+  model.process = SimpleNamespace(stdin=io.BytesIO())
+  model.first_run, model.frame_size = True, 16
+  model.last_good_time, model.held_output = None, False
+  model.prev_desire = np.zeros(8, np.float32)
+  model.views = {name: np.zeros(shape, np.float32) for name, shape in
+                 {'img': 16, 'big_img': 16, 'desire': 8, 'traffic_convention': 2, 'action_t': 2,
+                  'tfm': (3, 3), 'big_tfm': (3, 3)}.items()}
+  model.output, model.output_slices = np.array([1., 2.]), {'action': slice(0, 2)}
+  parsed = []
+  model.parser = SimpleNamespace(parse_outputs=lambda value: parsed.append(value) or value)
+  replies = iter(responses)
+  model._receive = lambda _: next(replies)
+  clock = SimpleNamespace(now=0.)
+  monkeypatch.setattr(runner.time, 'monotonic', lambda: clock.now)
+  monkeypatch.setattr(model, 'close', lambda: None)
+  from openpilot.selfdrive.modeld import precompiled_model
+  monkeypatch.setattr(precompiled_model, 'record_failure', lambda *a: None)
+  model.pkl_path = Path('unused.pkl')
+  frames = {name: SimpleNamespace(data=np.zeros(16, np.uint8)) for name in ('img', 'big_img')}
+  transforms = {name: np.eye(3, dtype=np.float32) for name in frames}
+  inputs = {'desire_pulse': np.zeros(8, np.float32), 'traffic_convention': np.zeros(2), 'action_t': np.zeros(2)}
+  try:
+    for index, response in enumerate(responses):
+      clock.now = age * index
+      if index == 1:
+        inputs['desire_pulse'][1] = 1
+      if not success and index == len(responses) - 1:
+        with pytest.raises(RuntimeError, match='invalid model worker response'):
+          model.run(frames, transforms, inputs, False)
+      else:
+        previous_time, previous_desire = model.last_good_time, model.prev_desire.copy()
+        output = model.run(frames, transforms, inputs, False)
+        if response == b'0\n':
+          assert output is None and model.last_good_time == previous_time
+          np.testing.assert_array_equal(model.prev_desire, previous_desire)
+    assert len(parsed) == responses.count(b'1\n')
+    if success:
+      assert model.views['desire'][1] == 1  # replay the rolled-back pulse once
   finally:
     model.process = None
